@@ -51,10 +51,26 @@ const User = mongoose.model('User', UserSchema);
 const RequestSchema = new mongoose.Schema({
   from_user_id: String,
   to_user_id: String,
-  status: { type: String, default: 'pending' }
+  status: { type: String, default: 'pending' },
+  message: String, // Add this
+  createdAt: { type: Date, default: Date.now }
 });
 
 const Request = mongoose.model('Request', RequestSchema);
+
+// Hackathon Schema - explicitly set collection name to 'hackathons'
+const HackathonSchema = new mongoose.Schema({
+  name: String,
+  startDate: Date,
+  endDate: Date,
+  location: String,
+  type: String,
+  url: String,
+  description: String,
+  isActive: { type: Boolean, default: true }
+}, { collection: 'hackathons' }); // Explicitly set collection name
+
+const Hackathon = mongoose.model('Hackathon', HackathonSchema);
 
 // Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -113,6 +129,60 @@ Respond with ONLY a number from 1-10 (no explanation, just the number).`;
     };
   }
 }
+
+// GET /hackathons - Fetch all hackathons from MongoDB
+app.get('/hackathons', async (req, res) => {
+  try {
+    console.log('Fetching hackathons from MongoDB...');
+    const hackathons = await Hackathon.find();
+    console.log(`Found ${hackathons.length} hackathons in database`);
+    
+    // Map to frontend format
+    const formatted = hackathons.map(hackathon => {
+      let start_date = null;
+      let end_date = null;
+      
+      if (hackathon.startDate) {
+        try {
+          start_date = new Date(hackathon.startDate).toISOString().split('T')[0];
+        } catch (e) {
+          console.warn('Invalid startDate format:', hackathon.startDate);
+        }
+      }
+      
+      if (hackathon.endDate) {
+        try {
+          end_date = new Date(hackathon.endDate).toISOString().split('T')[0];
+        } catch (e) {
+          console.warn('Invalid endDate format:', hackathon.endDate);
+        }
+      }
+      
+      return {
+        id: hackathon._id.toString(),
+        name: hackathon.name || 'Hackathon Event',
+        start_date: start_date,
+        end_date: end_date,
+        location: hackathon.location || 'Location TBD',
+        url: hackathon.url || 'https://mlh.io',
+        logo: null,
+        description: hackathon.description || '',
+        type: hackathon.type || ''
+      };
+    }).sort((a, b) => {
+      // Sort by start date, with null dates at the end
+      if (!a.start_date && !b.start_date) return 0;
+      if (!a.start_date) return 1;
+      if (!b.start_date) return -1;
+      return new Date(a.start_date) - new Date(b.start_date);
+    });
+    
+    res.json(formatted);
+  } catch (error) {
+    console.error('Error fetching hackathons:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // Root endpoint
 app.get('/', (req, res) => {
@@ -174,9 +244,10 @@ app.get('/api/users', async (req, res) => {
 });
 
 // POST request to send team request
+// POST request to send team request
 app.post('/request', async (req, res) => {
   try {
-    const { from_user_id, to_user_id } = req.body;
+    const { from_user_id, to_user_id, message } = req.body;
     
     // Check if user already sent 5 requests
     const requestCount = await Request.countDocuments({ 
@@ -191,6 +262,7 @@ app.post('/request', async (req, res) => {
     const newRequest = await Request.create({
       from_user_id,
       to_user_id,
+      message: message || '',
       status: 'pending'
     });
     
