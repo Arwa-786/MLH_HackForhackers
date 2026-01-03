@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import UserCard from '../components/UserCard';
 
-const TeamMatching = () => {
+const MatchingPage = () => {
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -10,55 +10,24 @@ const TeamMatching = () => {
   const [requestCount, setRequestCount] = useState(0);
   const MAX_REQUESTS = 5;
 
-  // API endpoint - update this to match your backend
-  const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3000/api';
+  const API_BASE_URL = 'http://localhost:3000';
 
   useEffect(() => {
     fetchUsers();
-    // Load sent requests from localStorage on mount
-    const savedRequests = localStorage.getItem('sentRequests');
-    const savedCount = localStorage.getItem('requestCount');
-    if (savedRequests) {
-      setSentRequests(new Set(JSON.parse(savedRequests)));
-    }
-    if (savedCount) {
-      setRequestCount(parseInt(savedCount, 10));
-    }
   }, []);
 
   const fetchUsers = async () => {
     try {
       setLoading(true);
-      // Replace with your actual API endpoint
       const response = await axios.get(`${API_BASE_URL}/users`);
-      
-      // Generate match scores for each user (AI-generated simulation)
-      const usersWithScores = response.data.map(user => ({
-        ...user,
-        matchScore: generateMatchScore(user)
-      }));
-      
-      setUsers(usersWithScores);
+      setUsers(response.data);
       setError(null);
     } catch (err) {
       console.error('Error fetching users:', err);
-      setError('Failed to load user profiles. Please try again later.');
-      // For development: use mock data if API fails
-      if (err.code === 'ERR_NETWORK' || err.message.includes('Network')) {
-        setUsers(getMockUsers());
-      }
+      setError('Failed to load user profiles. Please make sure the backend server is running.');
     } finally {
       setLoading(false);
     }
-  };
-
-  // Simulate AI-generated match score
-  // In production, this would come from your backend/AI service
-  const generateMatchScore = (user) => {
-    const scores = ['strong', 'good', 'okay', 'bad'];
-    // Simple simulation - in production, use actual AI matching logic
-    const randomScore = scores[Math.floor(Math.random() * scores.length)];
-    return randomScore;
   };
 
   const handleSendRequest = async (userId) => {
@@ -72,9 +41,12 @@ const TeamMatching = () => {
     }
 
     try {
-      // Replace with your actual API endpoint
-      await axios.post(`${API_BASE_URL}/requests`, {
-        targetUserId: userId
+      // For now, using a placeholder user ID - in production, get from auth
+      const from_user_id = 'current_user_id_placeholder';
+      
+      await axios.post(`${API_BASE_URL}/request`, {
+        from_user_id: from_user_id,
+        to_user_id: userId
       });
 
       // Update local state
@@ -82,58 +54,11 @@ const TeamMatching = () => {
       newSentRequests.add(userId);
       setSentRequests(newSentRequests);
       setRequestCount(requestCount + 1);
-
-      // Save to localStorage
-      localStorage.setItem('sentRequests', JSON.stringify(Array.from(newSentRequests)));
-      localStorage.setItem('requestCount', (requestCount + 1).toString());
     } catch (err) {
       console.error('Error sending request:', err);
-      alert('Failed to send request. Please try again.');
+      const errorMessage = err.response?.data?.error || 'Failed to send request. Please try again.';
+      alert(errorMessage);
     }
-  };
-
-  // Mock data for development (remove in production)
-  const getMockUsers = () => {
-    return [
-      {
-        _id: '1',
-        name: 'Alex Johnson',
-        school: 'MIT',
-        skills: ['React', 'Node.js', 'Python', 'Machine Learning'],
-        github: 'https://github.com/alexjohnson'
-      },
-      {
-        _id: '2',
-        name: 'Sarah Chen',
-        school: 'Stanford University',
-        skills: ['JavaScript', 'TypeScript', 'AWS', 'Docker'],
-        github: 'sarahchen'
-      },
-      {
-        _id: '3',
-        name: 'Michael Rodriguez',
-        school: 'UC Berkeley',
-        skills: ['Python', 'Django', 'PostgreSQL', 'Redis'],
-        github: 'https://github.com/mrodriguez'
-      },
-      {
-        _id: '4',
-        name: 'Emily Davis',
-        school: 'Harvard University',
-        skills: ['React', 'GraphQL', 'MongoDB', 'Express'],
-        github: 'emilydavis'
-      },
-      {
-        _id: '5',
-        name: 'David Kim',
-        school: 'Carnegie Mellon',
-        skills: ['C++', 'Java', 'Kubernetes', 'Microservices'],
-        github: 'https://github.com/davidkim'
-      }
-    ].map(user => ({
-      ...user,
-      matchScore: generateMatchScore(user)
-    }));
   };
 
   const canSendRequest = requestCount < MAX_REQUESTS;
@@ -146,10 +71,10 @@ const TeamMatching = () => {
           <h1 className="text-3xl font-bold text-gray-900 mb-2">
             Find Your Hackathon Team
           </h1>
-          <p className="text-gray-600">
+          <p className="text-gray-600 mb-4">
             Discover teammates with complementary skills
           </p>
-          <div className="mt-4 flex items-center gap-4">
+          <div className="flex items-center gap-4">
             <div className="bg-blue-100 px-4 py-2 rounded-lg">
               <span className="text-sm font-medium text-blue-800">
                 Requests Sent: {requestCount} / {MAX_REQUESTS}
@@ -185,7 +110,7 @@ const TeamMatching = () => {
               <UserCard
                 key={user._id}
                 user={user}
-                matchScore={user.matchScore}
+                matchScore={user.matchCategory || 'okay'}
                 onSendRequest={handleSendRequest}
                 isRequestSent={sentRequests.has(user._id)}
                 canSendRequest={canSendRequest}
@@ -205,5 +130,5 @@ const TeamMatching = () => {
   );
 };
 
-export default TeamMatching;
+export default MatchingPage;
 

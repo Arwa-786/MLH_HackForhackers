@@ -32,10 +32,16 @@ const UserCard = ({ user, matchScore, onSendRequest, isRequestSent, canSendReque
       {/* User Name */}
       <h3 className="text-xl font-bold text-gray-800 mb-3">{user.name}</h3>
 
-      {/* School */}
+      {/* School and Location */}
       <div className="mb-3">
         <p className="text-sm text-gray-600 font-medium">School</p>
         <p className="text-gray-800">{user.school || 'Not specified'}</p>
+        {user.location && (
+          <>
+            <p className="text-sm text-gray-600 font-medium mt-2">Location</p>
+            <p className="text-gray-800">{user.location}</p>
+          </>
+        )}
       </div>
 
       {/* Skills */}
@@ -57,21 +63,23 @@ const UserCard = ({ user, matchScore, onSendRequest, isRequestSent, canSendReque
         </div>
       </div>
 
-      {/* GitHub */}
+      {/* Tech Stack */}
       <div className="mb-4">
-        <p className="text-sm text-gray-600 font-medium">GitHub</p>
-        {user.github ? (
-          <a
-            href={user.github.startsWith('http') ? user.github : `https://github.com/${user.github}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-blue-600 hover:text-blue-800 underline text-sm"
-          >
-            {user.github}
-          </a>
-        ) : (
-          <p className="text-gray-400 text-sm">Not provided</p>
-        )}
+        <p className="text-sm text-gray-600 font-medium mb-2">Tech Stack</p>
+        <div className="flex flex-wrap gap-2">
+          {user.tech_stack && user.tech_stack.length > 0 ? (
+            user.tech_stack.map((tech, index) => (
+              <span
+                key={index}
+                className="px-2 py-1 bg-blue-100 text-blue-700 rounded-md text-xs font-medium"
+              >
+                {tech}
+              </span>
+            ))
+          ) : (
+            <span className="text-gray-400 text-sm">No tech stack listed</span>
+          )}
+        </div>
       </div>
 
       {/* Send Request Button */}

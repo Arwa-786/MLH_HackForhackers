@@ -1,10 +1,10 @@
 import React from 'react';
-import TeamMatching from './pages/TeamMatching';
+import MatchingPage from './pages/MatchingPage';
 
 function App() {
   return (
     <div className="App">
-      <TeamMatching />
+      <MatchingPage />
     </div>
   );
 }
