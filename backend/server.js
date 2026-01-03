@@ -72,60 +72,146 @@ const HackathonSchema = new mongoose.Schema({
 
 const Hackathon = mongoose.model('Hackathon', HackathonSchema);
 
+// Team Schema
+const TeamSchema = new mongoose.Schema({
+  hackathon_id: String,
+  members: [{ type: String, ref: 'User' }],
+  needed_roles: [String],
+  is_full: { type: Boolean, default: false },
+  created_at: { type: Date, default: Date.now }
+});
+
+const Team = mongoose.model('Team', TeamSchema);
+
 // Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Helper function to calculate match score using Gemini AI
-async function calculateMatchScore(currentUser, otherUser) {
+// AI Matchmaking Helper Functions
+async function calculateMatchScore(user1, user2, teamMembers = null) {
   try {
-    const model = genAI.getGenerativeModel({ model: 'gemini-pro' });
+    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
     
-    const prompt = `You are a hackathon team matching AI. Rate the compatibility between two developers on a scale of 1-10 based on their complementary skills.
+    let prompt;
+    
+    if (teamMembers && teamMembers.length > 0) {
+      // Team-based matching
+      const teamSkills = teamMembers.map(m => m.skills || []).flat();
+      const teamTechStack = teamMembers.map(m => m.tech_stack || []).flat();
+      const teamExperience = teamMembers.map(m => m.experience || []).flat();
+      
+      prompt = `You are an AI team matchmaking system for hackathons. Evaluate how well a candidate user would complement an existing team.
 
-Current User:
-- Skills: ${currentUser.skills.join(', ') || 'None listed'}
-- School: ${currentUser.school || 'Not specified'}
+EXISTING TEAM:
+- Combined Skills: ${[...new Set(teamSkills)].join(', ') || 'None'}
+- Tech Stack: ${[...new Set(teamTechStack)].join(', ') || 'None'}
+- Experience: ${[...new Set(teamExperience)].join(', ') || 'None'}
+- Team Size: ${teamMembers.length} members
 
-Other User:
-- Skills: ${otherUser.skills.join(', ') || 'None listed'}
-- School: ${otherUser.school || 'Not specified'}
+CANDIDATE USER:
+- Name: ${user2.name || 'Unknown'}
+- Skills: ${(user2.skills || []).join(', ') || 'None listed'}
+- Tech Stack: ${(user2.tech_stack || []).join(', ') || 'None listed'}
+- Experience: ${(user2.experience || []).join(', ') || 'None listed'}
+- School: ${user2.school || 'Not specified'}
+- Location: ${user2.location || 'Not specified'}
 
-Consider:
-1. How well their skills complement each other (e.g., frontend + backend, designer + developer)
-2. Diversity of skill sets (avoid too much overlap)
-3. Potential for a well-rounded team
+EVALUATION CRITERIA:
+1. Role Complementarity: Does this candidate fill gaps in the team? (e.g., if team has 2 coders, prioritize a Designer)
+2. Tech Stack Alignment: Can they work with the team's existing tech stack?
+3. Skill Diversity: Do they add unique value without too much overlap?
+4. Team Balance: Will they help create a well-rounded 4-person team?
 
-Respond with ONLY a number from 1-10 (no explanation, just the number).`;
+Respond with a JSON object in this exact format:
+{
+  "score": <number 0-100>,
+  "reason": "<brief explanation of why this is a good/bad match>",
+  "category": "<Strong|Good|Okay|Bad>",
+  "needed_roles": ["<role1>", "<role2>"] (what roles the team needs)
+}`;
+    } else {
+      // One-on-one matching
+      prompt = `You are an AI hackathon team matching system. Evaluate compatibility between two developers.
+
+USER 1:
+- Name: ${user1.name || 'Unknown'}
+- Skills: ${(user1.skills || []).join(', ') || 'None listed'}
+- Tech Stack: ${(user1.tech_stack || []).join(', ') || 'None listed'}
+- Experience: ${(user1.experience || []).join(', ') || 'None listed'}
+- School: ${user1.school || 'Not specified'}
+- Location: ${user1.location || 'Not specified'}
+
+USER 2:
+- Name: ${user2.name || 'Unknown'}
+- Skills: ${(user2.skills || []).join(', ') || 'None listed'}
+- Tech Stack: ${(user2.tech_stack || []).join(', ') || 'None listed'}
+- Experience: ${(user2.experience || []).join(', ') || 'None listed'}
+- School: ${user2.school || 'Not specified'}
+- Location: ${user2.location || 'Not specified'}
+
+EVALUATION CRITERIA:
+1. Role Complementarity: How well do their skills complement each other? (e.g., Frontend + Backend = High Score)
+2. Tech Stack Alignment: Can they work together effectively?
+3. Project Experience: Do their experiences align for hackathon success?
+
+Respond with a JSON object in this exact format:
+{
+  "score": <number 0-100>,
+  "reason": "<brief explanation of why this is a good/bad match>",
+  "category": "<Strong|Good|Okay|Bad>"
+}`;
+    }
 
     const result = await model.generateContent(prompt);
     const response = await result.response;
-    const score = parseInt(response.text().trim());
+    const text = response.text().trim();
     
-    // Validate and clamp score
-    const validScore = Math.max(1, Math.min(10, isNaN(score) ? 5 : score));
+    // Try to parse JSON from response
+    let matchData;
+    try {
+      // Extract JSON from markdown code blocks if present
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        matchData = JSON.parse(jsonMatch[0]);
+      } else {
+        matchData = JSON.parse(text);
+      }
+    } catch (e) {
+      console.warn('Failed to parse AI response as JSON, using fallback');
+      matchData = {
+        score: 50,
+        reason: 'AI response parsing failed',
+        category: 'Okay'
+      };
+    }
     
-    // Convert score to category
-    let matchCategory;
-    if (validScore >= 8) {
-      matchCategory = 'strong';
-    } else if (validScore >= 6) {
-      matchCategory = 'good';
-    } else if (validScore >= 4) {
-      matchCategory = 'okay';
+    // Validate and normalize score
+    const score = Math.max(0, Math.min(100, parseInt(matchData.score) || 50));
+    
+    // Determine category based on score
+    let category = matchData.category || 'Okay';
+    if (score >= 85) {
+      category = 'Strong';
+    } else if (score >= 60) {
+      category = 'Good';
+    } else if (score >= 40) {
+      category = 'Okay';
     } else {
-      matchCategory = 'bad';
+      category = 'Bad';
     }
     
     return {
-      matchScore: validScore,
-      matchCategory: matchCategory
+      score: score,
+      reason: matchData.reason || 'Match evaluation completed',
+      category: category,
+      needed_roles: matchData.needed_roles || []
     };
   } catch (error) {
     console.error('Error calculating match score:', error);
-    // Fallback to default score
     return {
-      matchScore: 5,
-      matchCategory: 'okay'
+      score: 50,
+      reason: 'Error calculating match score',
+      category: 'Okay',
+      needed_roles: []
     };
   }
 }
@@ -243,7 +329,37 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// POST request to send team request
+// POST /match-score - AI Matchmaking endpoint
+app.post('/match-score', async (req, res) => {
+  try {
+    const { user1_id, user2_id, team_member_ids, hackathon_id } = req.body;
+    
+    if (!user1_id || !user2_id) {
+      return res.status(400).json({ error: 'user1_id and user2_id are required' });
+    }
+    
+    const user1 = await User.findById(user1_id);
+    const user2 = await User.findById(user2_id);
+    
+    if (!user1 || !user2) {
+      return res.status(404).json({ error: 'One or both users not found' });
+    }
+    
+    let teamMembers = null;
+    if (team_member_ids && team_member_ids.length > 0) {
+      // Fetch team members for team-based matching
+      teamMembers = await User.find({ _id: { $in: team_member_ids } });
+    }
+    
+    const matchResult = await calculateMatchScore(user1, user2, teamMembers);
+    
+    res.json(matchResult);
+  } catch (error) {
+    console.error('Error in match-score:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // POST request to send team request
 app.post('/request', async (req, res) => {
   try {
@@ -267,6 +383,94 @@ app.post('/request', async (req, res) => {
     });
     
     res.json(newRequest);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /team/:userId - Get user's team
+app.get('/team/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const team = await Team.findOne({ members: userId, is_full: false });
+    
+    if (!team) {
+      return res.json({ team: null, needed_roles: [] });
+    }
+    
+    // Get team members details
+    const members = await User.find({ _id: { $in: team.members } });
+    
+    res.json({
+      team: {
+        ...team.toObject(),
+        members_details: members
+      },
+      needed_roles: team.needed_roles || []
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /team - Create or join team
+app.post('/team', async (req, res) => {
+  try {
+    const { hackathon_id, user_id } = req.body;
+    
+    if (!hackathon_id || !user_id) {
+      return res.status(400).json({ error: 'hackathon_id and user_id are required' });
+    }
+    
+    // Check if user is already in a team
+    const existingTeam = await Team.findOne({ 
+      members: user_id, 
+      is_full: false 
+    });
+    
+    if (existingTeam) {
+      return res.json(existingTeam);
+    }
+    
+    // Create new team or join existing
+    let team = await Team.findOne({ 
+      hackathon_id, 
+      is_full: false 
+    });
+    
+    if (!team) {
+      team = await Team.create({
+        hackathon_id,
+        members: [user_id],
+        needed_roles: [],
+        is_full: false
+      });
+    } else {
+      if (team.members.length >= 4) {
+        return res.status(400).json({ error: 'Team is full' });
+      }
+      team.members.push(user_id);
+      await team.save();
+    }
+    
+    // Check if team is now full (4 members)
+    if (team.members.length === 4) {
+      team.is_full = true;
+      await team.save();
+      
+      // Auto-cancel all pending requests for these 4 users
+      await Request.updateMany(
+        {
+          $or: [
+            { from_user_id: { $in: team.members }, status: 'pending' },
+            { to_user_id: { $in: team.members }, status: 'pending' }
+          ]
+        },
+        { status: 'cancelled' }
+      );
+    }
+    
+    res.json(team);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

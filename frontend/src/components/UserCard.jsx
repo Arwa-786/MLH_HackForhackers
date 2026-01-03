@@ -72,13 +72,13 @@ const UserCard = ({ user, matchScore, onSendRequest, isRequestSent, canSendReque
               <span
                 key={index}
                 className="px-2 py-1 bg-blue-100 text-blue-700 rounded-md text-xs font-medium"
-              >
+          >
                 {tech}
               </span>
             ))
-          ) : (
+        ) : (
             <span className="text-gray-400 text-sm">No tech stack listed</span>
-          )}
+        )}
         </div>
       </div>
 
