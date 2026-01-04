@@ -3,12 +3,24 @@ import mongoose from 'mongoose';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { Octokit } from '@octokit/rest';
 import axios from 'axios';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Initialize Octokit for GitHub API
+let octokit = null;
+if (process.env.GITHUB_TOKEN) {
+  octokit = new Octokit({
+    auth: process.env.GITHUB_TOKEN
+  });
+  console.log('✅ GitHub integration enabled');
+} else {
+  console.log('⚠️ GITHUB_TOKEN not set - GitHub features disabled');
+}
 
 // Middleware
 app.use(cors({
@@ -91,14 +103,27 @@ const HackathonSchema = new mongoose.Schema({
 const Hackathon = mongoose.model('Hackathon', HackathonSchema);
 
 // Team Schema
+// Support both hackathon_id (snake_case) and hackathonId (camelCase) for manually created teams
 const TeamSchema = new mongoose.Schema({
   hackathon_id: String,
+  hackathonId: String, // Support camelCase for manually created teams
   name: String, // Team name (e.g., "Team 1", "Team 2")
   members: [{ type: String, ref: 'User' }],
   needed_roles: [String],
   is_full: { type: Boolean, default: false },
+  messages: [{
+    senderId: String,
+    text: String,
+    timestamp: { type: Date, default: Date.now },
+    actionType: String, // Action type (e.g., 'GITHUB_INIT')
+    github_action: { type: Boolean, default: false }, // Flag for GitHub action buttons (backward compatibility)
+    project_name: String // Project name for GitHub repo
+  }],
+  github_repo: String, // Full repo name (owner/repo)
+  github_repo_url: String, // GitHub repository URL
+  replit_url: String, // Replit import URL
   created_at: { type: Date, default: Date.now }
-});
+}, { strict: false }); // Allow additional fields like hackathonId
 
 const Team = mongoose.model('Team', TeamSchema);
 
@@ -1008,6 +1033,61 @@ app.post('/request', async (req, res) => {
 });
 
 // GET /team/:userId - Get user's team
+// GET /api/team/:teamId - Get a single team by ID (includes messages)
+app.get('/api/team/:teamId', async (req, res) => {
+  try {
+    const { teamId } = req.params;
+    console.log(`📥 GET /api/team/:teamId - teamId: ${teamId}`);
+    
+    // Find team - try both ObjectId and string lookup
+    let team;
+    try {
+      const mongoose = require('mongoose');
+      if (mongoose.Types.ObjectId.isValid(teamId)) {
+        team = await Team.findById(teamId);
+      }
+    } catch (idError) {
+      console.log(`⚠️ ObjectId lookup failed:`, idError.message);
+    }
+    
+    if (!team) {
+      team = await Team.findOne({ _id: teamId.toString() });
+    }
+    
+    if (!team) {
+      console.error(`❌ Team not found: ${teamId}`);
+      return res.status(404).json({ error: 'Team not found' });
+    }
+    
+    // Get member details
+    const members = await User.find({ _id: { $in: team.members.map(id => id.toString()) } });
+    
+    // Get hackathon info
+    const hackathonId = team.hackathon_id || team.hackathonId;
+    const hackathon = hackathonId ? await Hackathon.findById(hackathonId) : null;
+    
+    const teamWithDetails = {
+      ...team.toObject(),
+      hackathon: hackathon ? {
+        name: hackathon.name,
+        location: hackathon.location
+      } : null,
+      memberDetails: members.map(m => ({
+        _id: m._id,
+        name: m.name,
+        skills: m.skills,
+        tech_stack: m.tech_stack
+      }))
+    };
+    
+    console.log(`✅ Team found with ${(team.messages || []).length} messages`);
+    res.json(teamWithDetails);
+  } catch (error) {
+    console.error('❌ Error fetching team:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /api/teams/:userId - Get all teams user is a member of
 app.get('/api/teams/:userId', async (req, res) => {
   try {
@@ -1018,15 +1098,19 @@ app.get('/api/teams/:userId', async (req, res) => {
     }
 
     // Find all teams where user is a member
+    // Handle both string IDs and ObjectIds
     const teams = await Team.find({
-      members: { $in: [userId, new mongoose.Types.ObjectId(userId)] }
+      members: { $in: [userId.toString()] }
     }).sort({ created_at: -1 });
 
     // Get hackathon and member details for each team
     const teamsWithDetails = await Promise.all(
       teams.map(async (team) => {
-        const hackathon = await Hackathon.findById(team.hackathon_id);
-        const members = await User.find({ _id: { $in: team.members } });
+        // Handle both hackathon_id and hackathonId (for manually created teams)
+        const hackathonId = team.hackathon_id || team.hackathonId;
+        const hackathon = hackathonId ? await Hackathon.findById(hackathonId) : null;
+        // Find members by string IDs
+        const members = await User.find({ _id: { $in: team.members.map(id => id.toString()) } });
         
         return {
           ...team.toObject(),
@@ -1063,14 +1147,17 @@ app.get('/team/:userId', async (req, res) => {
       return res.status(400).json({ error: 'userId is required' });
     }
 
-    // Build query
+    // Build query - handle string IDs
     const query = {
-      members: { $in: [userId, new mongoose.Types.ObjectId(userId)] }
+      members: { $in: [userId.toString()] }
     };
 
-    // If hackathonId is provided, filter by it
+    // If hackathonId is provided, filter by it (handle both hackathon_id and hackathonId)
     if (hackathonId) {
-      query.hackathon_id = hackathonId;
+      query.$or = [
+        { hackathon_id: hackathonId },
+        { hackathonId: hackathonId } // Support camelCase for manually created teams
+      ];
     }
 
     // Find team where user is a member
@@ -1270,6 +1357,705 @@ app.get('/api/requests/incoming/:userId', async (req, res) => {
   }
 });
 
+// POST /requests/:requestId/accept - Accept a team request and create/update team
+app.post('/requests/:requestId/accept', async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { current_user_id } = req.body; // User accepting the request
+    
+    if (!current_user_id) {
+      return res.status(400).json({ error: 'current_user_id is required' });
+    }
+    
+    // Find the request
+    const request = await Request.findById(requestId);
+    if (!request) {
+      return res.status(404).json({ error: 'Request not found' });
+    }
+    
+    if (request.status !== 'pending') {
+      return res.status(400).json({ error: 'Request is not pending' });
+    }
+    
+    // Verify the current user is the recipient
+    if (request.to_user_id !== current_user_id) {
+      return res.status(403).json({ error: 'You can only accept requests sent to you' });
+    }
+    
+    const senderId = request.from_user_id;
+    const hackathonId = request.hackathon_id;
+    
+    // Check if sender already has a team for this hackathon
+    let team = await Team.findOne({
+      $or: [
+        { hackathon_id: hackathonId },
+        { hackathonId: hackathonId } // Support camelCase for manually created teams
+      ],
+      members: senderId.toString()
+    });
+    
+    if (team) {
+      // Add current user to existing team
+      if (!team.members.includes(current_user_id.toString())) {
+        team.members.push(current_user_id.toString());
+        await team.save();
+      }
+    } else {
+      // Create new team with both users
+      const teamCount = await Team.countDocuments({ 
+        $or: [
+          { hackathon_id: hackathonId },
+          { hackathonId: hackathonId }
+        ]
+      });
+      const teamName = `Team ${teamCount + 1}`;
+      
+      team = await Team.create({
+        hackathon_id: hackathonId,
+        name: teamName,
+        members: [senderId.toString(), current_user_id.toString()],
+        is_full: false
+      });
+    }
+    
+    // Mark request as accepted
+    request.status = 'accepted';
+    await request.save();
+    
+    // Reject all other pending requests from the same sender for this hackathon
+    await Request.updateMany(
+      {
+        from_user_id: senderId,
+        hackathon_id: hackathonId,
+        status: 'pending',
+        _id: { $ne: requestId }
+      },
+      { status: 'rejected' }
+    );
+    
+    res.json({
+      success: true,
+      team: team,
+      message: 'Request accepted and team created/updated'
+    });
+  } catch (error) {
+    console.error('Error accepting request:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /chat/:teamId/messages - Get all messages for a team
+app.get('/chat/:teamId/messages', async (req, res) => {
+  try {
+    const { teamId } = req.params;
+    console.log(`📥 GET /chat/:teamId/messages - teamId: ${teamId}`);
+    
+    // Find team and return messages array
+    let team;
+    try {
+      const mongoose = require('mongoose');
+      if (mongoose.Types.ObjectId.isValid(teamId)) {
+        team = await Team.findById(teamId);
+      }
+    } catch (idError) {
+      console.log(`⚠️ ObjectId lookup failed:`, idError.message);
+    }
+    
+    if (!team) {
+      team = await Team.findOne({ _id: teamId.toString() });
+    }
+    
+    if (!team) {
+      console.error(`❌ Team not found: ${teamId}`);
+      return res.status(404).json({ error: 'Team not found' });
+    }
+    
+    const messages = (team.messages || []).sort((a, b) => {
+      const timeA = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+      const timeB = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+      return timeA - timeB;
+    });
+    
+    console.log(`✅ Found ${messages.length} messages for team ${teamId}`);
+    res.json(messages);
+  } catch (error) {
+    console.error('❌ Error fetching messages:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /chat/:teamId/messages - Send a message
+app.post('/chat/:teamId/messages', async (req, res) => {
+  try {
+    const { teamId } = req.params;
+    const { user_id, user_name, message } = req.body;
+    
+    console.log(`📨 POST /chat/:teamId/messages - teamId: ${teamId}, user_id: ${user_id}`);
+    console.log(`📋 Request body:`, { user_id, user_name, message: message?.substring(0, 50) });
+    
+    if (!user_id || !message) {
+      console.error('❌ Missing required fields:', { hasUserId: !!user_id, hasMessage: !!message });
+      return res.status(400).json({ error: 'user_id and message are required' });
+    }
+    
+    // Verify user is a member of the team - try both ObjectId and string lookup
+    let team;
+    // Try as ObjectId first
+    try {
+      const mongoose = require('mongoose');
+      if (mongoose.Types.ObjectId.isValid(teamId)) {
+        team = await Team.findById(teamId);
+      }
+    } catch (idError) {
+      console.log(`⚠️ ObjectId lookup failed:`, idError.message);
+    }
+    
+    // If not found, try as string
+    if (!team) {
+      console.log(`⚠️ Trying string lookup for: ${teamId}`);
+      team = await Team.findOne({ _id: teamId.toString() });
+    }
+    
+    // If still not found, try without _id field (in case it's stored differently)
+    if (!team) {
+      console.log(`⚠️ Trying alternative lookup for: ${teamId}`);
+      team = await Team.findOne({ $or: [{ _id: teamId }, { _id: teamId.toString() }] });
+    }
+    
+    if (!team) {
+      console.error(`❌ Team not found: ${teamId}`);
+      // Try to find any team to debug
+      const allTeams = await Team.find({}).limit(3).select('_id members');
+      console.log(`📋 Sample teams in DB:`, allTeams.map(t => ({ id: t._id, type: typeof t._id, members: t.members })));
+      return res.status(404).json({ error: 'Team not found' });
+    }
+    
+    console.log(`✅ Team found: ${team._id}, members:`, team.members);
+    
+    // Check membership with string comparison
+    const memberIds = team.members.map(id => id.toString());
+    const userIdStr = user_id.toString();
+    console.log(`🔍 Checking membership: ${userIdStr} in [${memberIds.join(', ')}]`);
+    
+    if (!memberIds.includes(userIdStr)) {
+      console.error(`❌ User ${userIdStr} is not a member of team ${team._id}`);
+      return res.status(403).json({ error: 'You are not a member of this team' });
+    }
+    
+    console.log(`✅ User is a member, adding message to team...`);
+    
+    // Add message to team.messages array using $push
+    const messageObject = {
+      senderId: userIdStr,
+      text: message,
+      timestamp: new Date()
+    };
+    
+    // Update team with $push
+    const updatedTeam = await Team.findByIdAndUpdate(
+      team._id,
+      { $push: { messages: messageObject } },
+      { new: true }
+    );
+    
+    if (!updatedTeam) {
+      return res.status(500).json({ error: 'Failed to update team with message' });
+    }
+    
+    console.log(`✅ Message added to team ${team._id}`);
+    res.json(messageObject);
+  } catch (error) {
+    console.error('❌ Error sending message:', error);
+    console.error('❌ Error stack:', error.stack);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/ai-mentor/:teamId - AI Mentor for team (conversational, team-wide)
+app.post('/api/ai-mentor/:teamId', async (req, res) => {
+  try {
+    const { teamId } = req.params;
+    const { message, teamContext } = req.body;
+    
+    console.log(`🤖 POST /api/ai-mentor/:teamId - teamId: ${teamId}`);
+    
+    if (!message) {
+      return res.status(400).json({ error: 'Message is required' });
+    }
+    
+    // Get team info - try both ObjectId and string lookup
+    let team;
+    try {
+      const mongoose = require('mongoose');
+      if (mongoose.Types.ObjectId.isValid(teamId)) {
+        team = await Team.findById(teamId);
+      }
+    } catch (idError) {
+      console.log(`⚠️ ObjectId lookup failed:`, idError.message);
+    }
+    
+    if (!team) {
+      team = await Team.findOne({ _id: teamId.toString() });
+    }
+    
+    if (!team) {
+      console.error(`❌ Team not found: ${teamId}`);
+      return res.status(404).json({ error: 'Team not found' });
+    }
+    
+    // Get hackathon info
+    const hackathonId = team.hackathon_id || team.hackathonId;
+    const hackathon = hackathonId ? await Hackathon.findById(hackathonId) : null;
+    const hackathonName = hackathon?.name || 'the hackathon';
+    const hackathonTheme = hackathon?.theme || hackathon?.description || 'General hackathon';
+    
+    // Get all team members' data
+    const members = teamContext?.memberDetails || await User.find({ _id: { $in: team.members.map(id => id.toString()) } });
+    
+    // Build comprehensive team profile
+    const memberProfiles = members.map(m => {
+      const name = m.name || 'Team Member';
+      const role = m.role_preference || 'Developer';
+      const skills = (m.skills || []).join(', ') || 'General development';
+      const tech = (m.tech_stack || []).join(', ') || 'Various technologies';
+      const experience = (m.experience || []).join(', ') || 'Hackathon experience';
+      return `- ${name} (${role}): Skills: ${skills} | Tech Stack: ${tech} | Experience: ${experience}`;
+    }).join('\n');
+    
+    // Get recent conversation context
+    const recentMessages = (team.messages || []).slice(-15).map(msg => {
+      const sender = msg.senderId === 'ai_bot' || msg.senderId === 'ai_mentor' ? 'AI Mentor' : 
+                     members.find(m => (m._id?.toString() || m._id) === msg.senderId)?.name || 'Team Member';
+      return `${sender}: ${msg.text}`;
+    }).join('\n');
+    
+    // Create comprehensive AI mentor prompt
+    const mentorPrompt = `You are an expert hackathon mentor. Your role is to provide clear, actionable, and CONCISE guidance to hackathon teams.
+
+CRITICAL RULES:
+1. BE CONCISE: Maximum 3-4 short paragraphs OR a structured list. NO word salad.
+2. BE SPECIFIC: Give concrete examples, not vague suggestions.
+3. BE ACTIONABLE: Every piece of advice should be immediately implementable.
+4. USE STRUCTURE: Bullet points, numbered lists, or clear sections. Avoid walls of text.
+5. BE REALISTIC: Consider 24-hour hackathon constraints. Don't suggest overly complex solutions.
+
+TEAM PROFILE:
+${memberProfiles}
+
+HACKATHON:
+- Name: ${hackathonName}
+- Theme: ${hackathonTheme}
+${hackathon?.location ? `- Location: ${hackathon.location}` : ''}
+${hackathon?.start_date ? `- Dates: ${hackathon.start_date}` : ''}
+
+${recentMessages ? `RECENT CONTEXT:\n${recentMessages}\n\n` : ''}
+
+QUESTION: ${message}
+
+RESPOND WITH:
+- Direct answer to the question
+- 2-3 specific, actionable steps or recommendations
+- Brief reasoning (1 sentence per point)
+- If asking for ideas: 2-3 project ideas with 1-sentence descriptions
+- If asking for plan: Clear phases with time estimates
+- If asking for organization: Specific role assignments based on team skills
+
+Keep it SHORT, PRACTICAL, and IMMEDIATELY USABLE.`;
+
+    console.log(`🤖 Calling Gemini API for AI mentor...`);
+    
+    // Use Gemini 2.5 Flash
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const result = await model.generateContent(mentorPrompt);
+    const response = await result.response;
+    const aiResponse = response.text().trim();
+    
+    console.log(`✅ AI mentor response received (length: ${aiResponse.length})`);
+    
+    res.json({ response: aiResponse });
+  } catch (error) {
+    console.error('❌ Error getting AI mentor response:', error);
+    console.error('❌ Error stack:', error.stack);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /chat/:teamId/ai-advice - Get AI advice for the team
+app.post('/chat/:teamId/ai-advice', async (req, res) => {
+  try {
+    const { teamId } = req.params;
+    const { prompt, activeAgent } = req.body; // Optional: custom prompt and activeAgent
+    
+    console.log(`🤖 POST /chat/:teamId/ai-advice - teamId: ${teamId}`);
+    
+    // Get team info - try both ObjectId and string lookup
+    let team;
+    try {
+      const mongoose = require('mongoose');
+      if (mongoose.Types.ObjectId.isValid(teamId)) {
+        team = await Team.findById(teamId);
+      }
+    } catch (idError) {
+      console.log(`⚠️ ObjectId lookup failed:`, idError.message);
+    }
+    
+    if (!team) {
+      team = await Team.findOne({ _id: teamId.toString() });
+    }
+    
+    if (!team) {
+      console.error(`❌ Team not found: ${teamId}`);
+      return res.status(404).json({ error: 'Team not found' });
+    }
+    
+    // Get hackathon info - handle both hackathon_id and hackathonId
+    const hackathonId = team.hackathon_id || team.hackathonId;
+    const hackathon = hackathonId ? await Hackathon.findById(hackathonId) : null;
+    const hackathonName = hackathon?.name || 'the hackathon';
+    
+    // Get all team members' data
+    const members = await User.find({ _id: { $in: team.members.map(id => id.toString()) } });
+    
+    // Build member skills summary
+    const memberSkills = members.map(m => {
+      const skills = (m.skills || []).join(', ') || 'General developer';
+      const tech = (m.tech_stack || []).join(', ') || 'Various technologies';
+      return `${m.name || 'Member'}: ${skills} (${tech})`;
+    }).join('\n');
+    
+    // Get recent messages for context (last 10 messages)
+    const recentMessages = (team.messages || []).slice(-10).map(msg => {
+      const sender = msg.senderId === 'ai_bot' ? 'AI Mentor' : 
+                     members.find(m => m._id.toString() === msg.senderId)?.name || 'User';
+      return `${sender}: ${msg.text}`;
+    }).join('\n');
+    
+    // Determine system prompt based on activeAgent
+    let systemPrompt = '';
+    switch (activeAgent) {
+      case 'ARCHITECT':
+        systemPrompt = `You are a Technical Architect AI mentor specializing in GitHub repository structure, tech stack decisions, and code organization.
+
+Your expertise includes:
+- Recommending optimal project structure and folder organization
+- Suggesting appropriate tech stacks based on team skills
+- Creating GitHub repository scaffolding with proper README, .gitignore, and initial file structure
+- Advising on architecture patterns, API design, and database schemas
+- Setting up development environments and build configurations
+
+TEAM MEMBERS:
+${memberSkills}
+
+HACKATHON: ${hackathonName}
+
+${recentMessages ? `RECENT CONVERSATION:\n${recentMessages}\n\n` : ''}
+
+Focus on providing technical architecture guidance. When the team is ready to start coding, recommend a specific project structure and include a JSON object at the end with:
+{
+  "actionType": "GITHUB_INIT",
+  "project_name": "<suggested project name>",
+  "ready_to_code": true
+}`;
+        break;
+        
+      case 'SCRUM_MASTER':
+        systemPrompt = `You are a Scrum Master AI mentor specializing in Replit collaboration, task timing, sprint planning, and team coordination.
+
+Your expertise includes:
+- Breaking down projects into manageable tasks and sprints
+- Estimating time for each task (ideal for 24-hour hackathons)
+- Coordinating team member responsibilities
+- Setting up Replit collaboration workflows
+- Managing deadlines and ensuring team stays on track
+- Facilitating stand-ups and progress check-ins
+
+TEAM MEMBERS:
+${memberSkills}
+
+HACKATHON: ${hackathonName}
+
+${recentMessages ? `RECENT CONVERSATION:\n${recentMessages}\n\n` : ''}
+
+Focus on project management, task breakdown, and collaboration strategies. Provide time estimates and help coordinate team efforts.`;
+        break;
+        
+      case 'DESIGNER':
+        systemPrompt = `You are a UI/UX Designer AI mentor specializing in user interface design, user experience, styling, and visual aesthetics.
+
+Your expertise includes:
+- Creating intuitive and beautiful user interfaces
+- Recommending color schemes, typography, and design systems
+- Suggesting UI frameworks and styling libraries (Tailwind, Material-UI, etc.)
+- Designing user flows and wireframes
+- Ensuring accessibility and responsive design
+- Creating design mockups and component structures
+
+TEAM MEMBERS:
+${memberSkills}
+
+HACKATHON: ${hackathonName}
+
+${recentMessages ? `RECENT CONVERSATION:\n${recentMessages}\n\n` : ''}
+
+Focus on UI/UX design, styling recommendations, and visual aesthetics. Help create beautiful and functional user interfaces.`;
+        break;
+        
+      default:
+        // Default mentor (general)
+        systemPrompt = `You are an expert hackathon mentor helping a team plan their project.
+
+TEAM MEMBERS:
+${memberSkills}
+
+HACKATHON: ${hackathonName}
+
+${recentMessages ? `RECENT CONVERSATION:\n${recentMessages}\n\n` : ''}
+
+Based on the team's combined skills and tech stack${recentMessages ? ' and the recent conversation' : ''}, provide:
+1. A unique project name
+2. A brief project description (2-3 sentences)
+3. Three specific project ideas that leverage the team's strengths
+4. A step-by-step 24-hour execution plan broken into phases
+
+IMPORTANT: After suggesting a project, you must provide a call-to-action. If the team is ready to start coding, include a JSON object at the end of your response with:
+{
+  "actionType": "GITHUB_INIT",
+  "project_name": "<suggested project name>",
+  "ready_to_code": true
+}
+
+Format your response as a clear, actionable plan that the team can follow immediately. If the team has a clear project idea and is ready to start, set actionType to "GITHUB_INIT".`;
+    }
+    
+    // Create AI prompt
+    const aiPrompt = prompt || systemPrompt;
+    
+    console.log(`🤖 Calling Gemini API for AI advice...`);
+    
+    // Use Gemini 2.5 Flash
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const result = await model.generateContent(aiPrompt);
+    const response = await result.response;
+    const aiResponse = response.text().trim();
+    
+    console.log(`✅ AI response received (length: ${aiResponse.length})`);
+    
+    // Try to extract JSON from the response (for actionType flag)
+    let actionType = null;
+    let projectName = null;
+    let cleanedResponse = aiResponse.trim();
+    
+    try {
+      // Look for JSON object at the end of the response
+      const jsonMatch = aiResponse.match(/\{[\s\S]*"actionType"[\s\S]*\}/);
+      if (jsonMatch) {
+        const jsonData = JSON.parse(jsonMatch[0]);
+        actionType = jsonData.actionType || null;
+        projectName = jsonData.project_name || null;
+        // Remove JSON from the text response
+        cleanedResponse = aiResponse.replace(/\{[\s\S]*"actionType"[\s\S]*\}/, '').trim();
+      }
+      // Fallback: check for old github_action format
+      else {
+        const oldJsonMatch = aiResponse.match(/\{[\s\S]*"github_action"[\s\S]*\}/);
+        if (oldJsonMatch) {
+          const jsonData = JSON.parse(oldJsonMatch[0]);
+          if (jsonData.github_action === true) {
+            actionType = 'GITHUB_INIT';
+            projectName = jsonData.project_name || null;
+            cleanedResponse = aiResponse.replace(/\{[\s\S]*"github_action"[\s\S]*\}/, '').trim();
+          }
+        }
+      }
+    } catch (parseError) {
+      console.log('⚠️ Could not parse JSON from AI response, continuing with text only');
+    }
+    
+    // Add AI message to team.messages array using $push
+    // Ensure it's a NEW, SEPARATE object (not appended to existing message)
+    const aiMessageObject = {
+      senderId: 'ai_bot',
+      text: cleanedResponse,
+      timestamp: new Date(),
+      actionType: actionType, // New field: actionType (e.g., 'GITHUB_INIT')
+      project_name: projectName,
+      // Keep github_action for backward compatibility
+      github_action: actionType === 'GITHUB_INIT'
+    };
+    
+    // Update team with $push - this creates a NEW message object in the array
+    const updatedTeam = await Team.findByIdAndUpdate(
+      team._id,
+      { $push: { messages: aiMessageObject } },
+      { new: true }
+    );
+    
+    if (!updatedTeam) {
+      return res.status(500).json({ error: 'Failed to update team with AI message' });
+    }
+    
+    // Verify the message was added as a separate object
+    const lastMessage = updatedTeam.messages[updatedTeam.messages.length - 1];
+    console.log(`✅ AI message added to team ${team._id} as separate object:`, {
+      senderId: lastMessage.senderId,
+      textLength: lastMessage.text?.length,
+      timestamp: lastMessage.timestamp
+    });
+    
+    res.json(aiMessageObject);
+  } catch (error) {
+    console.error('❌ Error getting AI advice:', error);
+    console.error('❌ Error stack:', error.stack);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /github/init - Initialize GitHub repository for team
+app.post('/github/init', async (req, res) => {
+  try {
+    const { teamId, projectName } = req.body;
+    
+    console.log(`🔧 POST /github/init - teamId: ${teamId}, projectName: ${projectName}`);
+    
+    if (!octokit) {
+      return res.status(503).json({ error: 'GitHub integration not configured. GITHUB_TOKEN not set in .env' });
+    }
+    
+    if (!teamId) {
+      return res.status(400).json({ error: 'teamId is required' });
+    }
+    
+    // Get team info
+    let team;
+    try {
+      if (mongoose.Types.ObjectId.isValid(teamId)) {
+        team = await Team.findById(teamId);
+      }
+    } catch (idError) {
+      console.log(`⚠️ ObjectId lookup failed:`, idError.message);
+    }
+    
+    if (!team) {
+      team = await Team.findOne({ _id: teamId.toString() });
+    }
+    
+    if (!team) {
+      return res.status(404).json({ error: 'Team not found' });
+    }
+    
+    // Get team members with GitHub usernames
+    const members = await User.find({ _id: { $in: team.members.map(id => id.toString()) } });
+    const githubUsernames = members
+      .map(m => m.github)
+      .filter(github => github && github.trim())
+      .map(github => github.replace(/^https?:\/\/(www\.)?github\.com\//, '').replace(/\/$/, '').trim());
+    
+    if (githubUsernames.length === 0) {
+      return res.status(400).json({ error: 'No team members have GitHub usernames configured in their profiles' });
+    }
+    
+    // Generate repository name
+    const repoName = projectName 
+      ? projectName.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').substring(0, 100)
+      : `hackathon-${team.name?.toLowerCase().replace(/[^a-z0-9-]/g, '-') || 'project'}-${Date.now()}`;
+    
+    // Get the authenticated user (token owner) to create the repo
+    const { data: authUser } = await octokit.users.getAuthenticated();
+    const repoOwner = authUser.login;
+    
+    console.log(`📦 Creating repository: ${repoOwner}/${repoName}`);
+    
+    // Create repository
+    let repo;
+    try {
+      repo = await octokit.repos.createForAuthenticatedUser({
+        name: repoName,
+        description: `Hackathon project: ${projectName || team.name || 'Team Project'}`,
+        private: false,
+        auto_init: true // Initialize with README
+      });
+      
+      console.log(`✅ Repository created: ${repo.data.full_name}`);
+    } catch (repoError) {
+      console.error('❌ Error creating repository:', repoError);
+      return res.status(500).json({ 
+        error: 'Failed to create repository', 
+        details: repoError.message 
+      });
+    }
+    
+    const repoFullName = repo.data.full_name;
+    const [owner, name] = repoFullName.split('/');
+    
+    // Invite team members to the repository
+    const inviteResults = [];
+    for (const username of githubUsernames) {
+      // Skip if it's the repo owner
+      if (username === repoOwner) {
+        inviteResults.push({ username, status: 'owner' });
+        continue;
+      }
+      
+      try {
+        await octokit.repos.addCollaborator({
+          owner,
+          repo: name,
+          username,
+          permission: 'push'
+        });
+        inviteResults.push({ username, status: 'invited' });
+        console.log(`✅ Invited ${username} to repository`);
+      } catch (inviteError) {
+        console.log(`⚠️ Could not invite ${username}:`, inviteError.message);
+        inviteResults.push({ username, status: 'failed', error: inviteError.message });
+      }
+    }
+    
+    // Generate Replit import URL
+    const replitUrl = `https://replit.com/github/${owner}/${name}`;
+    
+    // Update team with repository info
+    await Team.findByIdAndUpdate(
+      team._id,
+      { 
+        $set: { 
+          github_repo: repoFullName,
+          github_repo_url: repo.data.html_url,
+          replit_url: replitUrl
+        } 
+      }
+    );
+    
+    // Post a new message in the chat with the GitHub link
+    const githubMessage = {
+      senderId: 'ai_bot',
+      text: `✅ GitHub repository initialized successfully!\n\n🔗 Repository: ${repoFullName}\n📦 URL: ${repo.data.html_url}\n\nYou can now start pushing code to your repository. The Replit import URL is: ${replitUrl}`,
+      timestamp: new Date()
+    };
+    
+    await Team.findByIdAndUpdate(
+      team._id,
+      { $push: { messages: githubMessage } },
+      { new: true }
+    );
+    
+    res.json({
+      success: true,
+      repository: {
+        name: repoFullName,
+        url: repo.data.html_url,
+        clone_url: repo.data.clone_url
+      },
+      replit_url: replitUrl,
+      invites: inviteResults
+    });
+  } catch (error) {
+    console.error('❌ Error initializing GitHub repository:', error);
+    console.error('❌ Error stack:', error.stack);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
@@ -1366,7 +2152,10 @@ app.listen(PORT, () => {
   console.log(`   GET  /chat/:teamId/messages`);
   console.log(`   POST /chat/:teamId/messages`);
   console.log(`   POST /chat/:teamId/ai-advice`);
+  console.log(`   POST /api/ai-mentor/:teamId`);
+  console.log(`   POST /github/init`);
   console.log(`   GET  /api/requests/incoming/:userId`);
+  console.log(`   GET  /api/team/:teamId`);
   console.log(`   GET  /api/teams/:userId`);
   console.log(`\n✅ All routes registered successfully!`);
 });

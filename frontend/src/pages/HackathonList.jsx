@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import HackathonCard from '../components/HackathonCard';
 import GroupsPanel from '../components/GroupsPanel';
 import ChatPanel from '../components/ChatPanel';
+import AIMentorPanel from '../components/AIMentorPanel';
 
 const HackathonList = () => {
   const [hackathons, setHackathons] = useState([]);
@@ -16,6 +17,7 @@ const HackathonList = () => {
   const [showGroupsPanel, setShowGroupsPanel] = useState(false);
   const [selectedTeam, setSelectedTeam] = useState(null);
   const [showChat, setShowChat] = useState(false);
+  const [showAIMentor, setShowAIMentor] = useState(false);
   const [currentUserName, setCurrentUserName] = useState('');
   const navigate = useNavigate();
   const CURRENT_USER_ID = '6958c084d6d4ea1f109dad70'; // Hardcoded current user ID
@@ -224,7 +226,7 @@ const HackathonList = () => {
         </div>
       </div>
       
-      <div className={`max-w-7xl mx-auto py-12 px-4 relative z-10 transition-all duration-300 ${showGroupsPanel ? 'ml-80' : ''} ${showChat ? 'mr-80' : ''}`}>
+      <div className={`max-w-7xl mx-auto py-12 px-4 relative z-10 transition-all duration-300 ${showGroupsPanel ? 'ml-80' : ''} ${showAIMentor ? 'mr-96' : ''} ${showChat ? 'opacity-0 pointer-events-none' : ''}`}>
         {/* Header */}
         <div className="text-center mb-12">
           <div className="text-left mb-4 text-[#39ff14] text-sm pixel-text">

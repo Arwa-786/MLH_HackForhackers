@@ -3,6 +3,7 @@ import axios from 'axios';
 import { useParams, useNavigate } from 'react-router-dom';
 import ChatPanel from '../components/ChatPanel';
 import GroupsPanel from '../components/GroupsPanel';
+import AIMentorPanel from '../components/AIMentorPanel';
 
 export default function MatchingPage() {
   const { hackathonId } = useParams();
@@ -37,6 +38,7 @@ export default function MatchingPage() {
   const [showRequestsModal, setShowRequestsModal] = useState(false);
   const [showGroupsPanel, setShowGroupsPanel] = useState(false);
   const [selectedTeam, setSelectedTeam] = useState(null);
+  const [showAIMentor, setShowAIMentor] = useState(false);
 
   useEffect(() => {
     fetchUsers();
@@ -384,7 +386,7 @@ export default function MatchingPage() {
         </button>
       )}
 
-      <div className={`max-w-6xl mx-auto relative z-10 transition-all duration-300 ${showGroupsPanel ? 'ml-80' : ''} ${showChat ? 'mr-80' : ''}`}>
+      <div className={`max-w-6xl mx-auto relative z-10 transition-all duration-300 ${showGroupsPanel ? 'ml-80' : ''} ${showAIMentor ? 'mr-96' : ''} ${showChat ? 'opacity-0 pointer-events-none' : ''}`}>
         {/* Back Button */}
         <button
           onClick={() => navigate('/hackathons')}
@@ -974,6 +976,16 @@ export default function MatchingPage() {
             setShowChat(false);
             setSelectedTeam(null);
           }}
+        />
+      )}
+
+      {/* AI Mentor Panel */}
+      {selectedTeam && (
+        <AIMentorPanel
+          team={selectedTeam}
+          currentUserId={CURRENT_USER_ID}
+          isOpen={showAIMentor}
+          onClose={() => setShowAIMentor(!showAIMentor)}
         />
       )}
     </div>
