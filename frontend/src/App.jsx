@@ -1,5 +1,6 @@
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import LandingPage from './pages/LandingPage';
 import HackathonList from './pages/HackathonList';
 import MatchingPage from './pages/MatchingPage';
 
@@ -7,7 +8,8 @@ function App() {
   return (
     <Router>
       <Routes>
-        <Route path="/" element={<HackathonList />} />
+        <Route path="/" element={<LandingPage />} />
+        <Route path="/hackathons" element={<HackathonList />} />
         <Route path="/matching/:hackathonId" element={<MatchingPage />} />
       </Routes>
     </Router>

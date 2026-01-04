@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import axios from 'axios';
 
 dotenv.config();
 
@@ -10,8 +11,13 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
-app.use(cors());
-app.use(express.json());
+app.use(cors({
+  origin: '*', // Allow all origins (or specify your frontend URL)
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json({ limit: '100mb' })); // Increase limit for large PDF uploads
+app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
 // MongoDB Connection
 if (!process.env.MONGODB_URI) {
@@ -35,6 +41,7 @@ mongoose.connect(process.env.MONGODB_URI)
 const UserSchema = new mongoose.Schema({
   name: String,
   email: String,
+  role_preference: String,
   skills: [String],
   tech_stack: [String],
   experience: [String],
@@ -42,7 +49,9 @@ const UserSchema = new mongoose.Schema({
   devpost: String,
   github: String,
   school: String,
-  location: String
+  location: String,
+  description: String,
+  registered_hackathons: [String] // Array of hackathon IDs
 });
 
 const User = mongoose.model('User', UserSchema);
@@ -51,8 +60,9 @@ const User = mongoose.model('User', UserSchema);
 const RequestSchema = new mongoose.Schema({
   from_user_id: String,
   to_user_id: String,
+  hackathon_id: String,
   status: { type: String, default: 'pending' },
-  message: String, // Add this
+  message: String,
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -84,21 +94,159 @@ const TeamSchema = new mongoose.Schema({
 const Team = mongoose.model('Team', TeamSchema);
 
 // Initialize Gemini AI
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+
+// Verify API key is set
+if (!process.env.GEMINI_API_KEY) {
+  console.warn('⚠️  WARNING: GEMINI_API_KEY not found in environment variables');
+}
+
+// Helper function to get model
+function getModel(modelName = 'gemini-2.5-flash') {
+  return genAI.getGenerativeModel({ model: modelName });
+}
+
+// List available models from the API
+async function listAvailableModels() {
+  try {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return [];
+    }
+    
+    // Use v1 API (stable endpoint)
+    const apiVersions = ['v1'];
+    
+    for (const version of apiVersions) {
+      try {
+        console.log(`🔍 Trying to list models using ${version} API...`);
+        const response = await axios.get(
+          `https://generativelanguage.googleapis.com/${version}/models?key=${apiKey}`,
+          { timeout: 10000 }
+        );
+        
+        if (response.data && response.data.models) {
+          const modelNames = response.data.models
+            .filter(m => m.supportedGenerationMethods && m.supportedGenerationMethods.includes('generateContent'))
+            .map(m => m.name.replace('models/', ''));
+          
+          console.log(`✅ Found ${modelNames.length} available models using ${version} API:`, modelNames);
+          return modelNames;
+        }
+      } catch (versionError) {
+        const status = versionError.response?.status;
+        const statusText = versionError.response?.statusText;
+        const errorData = versionError.response?.data;
+        
+        if (status === 400 && (errorData?.error?.message?.includes('expired') || errorData?.error?.message?.includes('API_KEY'))) {
+          console.error(`❌ API key appears to be expired or invalid (${version} API)`);
+          throw new Error('API key expired or invalid. Please get a new API key from https://aistudio.google.com/apikey');
+        }
+        
+        console.log(`⚠️  ${version} API failed: ${status} ${statusText || versionError.message}`);
+        continue;
+      }
+    }
+    
+    return [];
+  } catch (error) {
+    if (error.message.includes('expired') || error.message.includes('invalid')) {
+      throw error; // Re-throw API key errors
+    }
+    console.error('❌ Error listing models:', error.message);
+    if (error.response) {
+      console.error('   Status:', error.response.status);
+      console.error('   Response:', JSON.stringify(error.response.data).substring(0, 200));
+    }
+    return [];
+  }
+}
+
+// Try to determine which model works by testing API call
+async function getWorkingModel() {
+  // First, verify API key is set
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY is not set in environment variables. Add it to your backend/.env file.');
+  }
+  
+  if (process.env.GEMINI_API_KEY.length < 20) {
+    throw new Error('GEMINI_API_KEY appears to be invalid (too short). Please check your .env file.');
+  }
+  
+  // Try to list available models first
+  console.log('🔍 Attempting to list available models from API...');
+  const availableModels = await listAvailableModels();
+  
+  const testPrompt = 'Hi';
+  // Start with models from the API, then fallback to common names
+  let modelsToTry = availableModels.length > 0 
+    ? availableModels 
+      : [
+        'gemini-2.5-flash',        // Latest flash model (most available)
+        'gemini-2.5-pro',          // Latest pro model
+        'gemini-pro',              // Original model (fallback)
+        'gemini-1.5-pro',
+        'gemini-2.5-flash'  // Fallback to latest if others fail
+      ];
+  
+  console.log(`📋 Will try ${modelsToTry.length} models:`, modelsToTry);
+  let lastError = null;
+  
+  for (const modelName of modelsToTry) {
+    try {
+      console.log(`🔍 Trying model: ${modelName}`);
+      const model = getModel(modelName);
+      // Make a very short test call with timeout
+      const result = await Promise.race([
+        model.generateContent(testPrompt),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000))
+      ]);
+    const response = await result.response;
+      const text = response.text();
+      console.log(`✅ Model ${modelName} is available and working!`);
+      return model;
+    } catch (error) {
+      const errorMsg = error.message || error.toString();
+      lastError = errorMsg;
+      console.log(`❌ Model ${modelName} failed: ${errorMsg.substring(0, 200)}`);
+      
+      // If it's a 401/403/400 with API key error, the API key is invalid or expired
+      if (errorMsg.includes('401') || errorMsg.includes('403') || 
+          errorMsg.includes('API_KEY') || errorMsg.includes('API key') ||
+          errorMsg.includes('API key expired') || errorMsg.includes('API_KEY_INVALID') ||
+          errorMsg.includes('expired')) {
+        throw new Error('Invalid, expired, or unauthorized GEMINI_API_KEY. Please:\n1. Get a NEW API key from https://aistudio.google.com/apikey (make sure to create a new one, not reuse an old one)\n2. Copy the ENTIRE key (it should be ~39 characters)\n3. Add it to backend/.env as: GEMINI_API_KEY=your_key_here\n4. Make sure there are no extra spaces or quotes\n5. Restart your server after updating .env');
+      }
+      
+      // If it's a 404, model not found - continue to next
+      if (errorMsg.includes('404') || errorMsg.includes('not found')) {
+        continue;
+      }
+      
+      // For other errors, continue trying
+      continue;
+    }
+  }
+  
+  // If we get here, all models failed
+  const errorDetails = lastError ? `\nLast error: ${lastError.substring(0, 200)}` : '';
+  throw new Error(`No working Gemini models found.${errorDetails}\n\nTroubleshooting:\n1. Verify your API key at https://aistudio.google.com/apikey\n2. Make sure GEMINI_API_KEY is set in backend/.env\n3. Restart your server after updating .env\n4. Check that your API key has access to Gemini models`);
+}
 
 // AI Matchmaking Helper Functions
 async function calculateMatchScore(user1, user2, teamMembers = null) {
   try {
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-    
+    // Use gemini-2.5-flash (available in v1 API)
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+
     let prompt;
-    
+
     if (teamMembers && teamMembers.length > 0) {
       // Team-based matching
       const teamSkills = teamMembers.map(m => m.skills || []).flat();
       const teamTechStack = teamMembers.map(m => m.tech_stack || []).flat();
       const teamExperience = teamMembers.map(m => m.experience || []).flat();
-      
+
       prompt = `You are an AI team matchmaking system for hackathons. Evaluate how well a candidate user would complement an existing team.
 
 EXISTING TEAM:
@@ -129,74 +277,148 @@ Respond with a JSON object in this exact format:
   "needed_roles": ["<role1>", "<role2>"] (what roles the team needs)
 }`;
     } else {
-      // One-on-one matching
-      prompt = `You are an AI hackathon team matching system. Evaluate compatibility between two developers.
+      // One-on-one matching with Current User logic
+      const CURRENT_USER_ID = '6958c084d6d4ea1f109dad70';
+      const isCurrentUser = user1._id.toString() === CURRENT_USER_ID;
+
+      if (isCurrentUser) {
+        // Current User: Full Stack, VR, AI Engineering (Unity, Swift, Python)
+        // High scores for: Backend (Node.js/Go), 3D Modeling, Design
+        // Low scores for: Only Swift/Unity (skill overlap)
+        prompt = `You are a HARSH hackathon judge. Do NOT give neutral scores. Be aggressive in your scoring.
+
+CURRENT USER (Me):
+- Name: ${user1.name || 'Unknown'}
+- Skills: ${(user1.skills || []).join(', ') || 'Full Stack, VR, AI Engineering'}
+- Tech Stack: ${(user1.tech_stack || []).join(', ') || 'Unity, Swift, Python'}
+- Experience: ${(user1.experience || []).join(', ') || 'VR development, Mobile apps, AI/ML'}
+- Bio: ${user1.description || 'Full Stack developer specializing in VR and AI'}
+- Role: ${user1.role_preference || 'Full Stack'}
+
+TARGET USER:
+- Name: ${user2.name || 'Unknown'}
+- Skills: ${(user2.skills || []).join(', ') || 'None listed'}
+- Tech Stack: ${(user2.tech_stack || []).join(', ') || 'None listed'}
+- Experience: ${(user2.experience || []).join(', ') || 'None listed'}
+- Bio: ${user2.description || 'No bio provided'}
+- Role: ${user2.role_preference || 'Not specified'}
+
+SCORING RULES (BE STRICT):
+1. Score ABOVE 90%: Skills are PERFECTLY complementary (e.g., Unity/VR vs. Go/Backend, Swift/Mobile vs. Node.js/Backend, Python/AI vs. 3D Modeling/Design)
+2. Score 60-85%: Skills are somewhat complementary but not perfect
+3. Score BELOW 40%: Skills are nearly IDENTICAL (e.g., both know Swift/Unity, both know Python/AI with same focus)
+4. DO NOT give scores around 50% - be decisive!
+
+Examples:
+- Unity + Swift (current) vs. Go + Node.js (target) = 95% (perfect complement)
+- Unity + Swift (current) vs. Swift + Unity (target) = 30% (too similar)
+- Unity + Swift (current) vs. React + Frontend (target) = 70% (somewhat complementary)
+
+Respond with ONLY a JSON object (no markdown, no code blocks):
+{
+  "score": <number 0-100>,
+  "reason": "<brief 1-sentence explanation why this is a good/bad match>",
+  "category": "<Strong Match|Good Match|Okay Match>"
+}`;
+      } else {
+        // Generic matching
+        prompt = `You are a HARSH hackathon judge. Do NOT give neutral scores. Be aggressive in your scoring.
 
 USER 1:
 - Name: ${user1.name || 'Unknown'}
 - Skills: ${(user1.skills || []).join(', ') || 'None listed'}
 - Tech Stack: ${(user1.tech_stack || []).join(', ') || 'None listed'}
 - Experience: ${(user1.experience || []).join(', ') || 'None listed'}
-- School: ${user1.school || 'Not specified'}
-- Location: ${user1.location || 'Not specified'}
+- Bio: ${user1.description || 'No bio provided'}
+- Role: ${user1.role_preference || 'Not specified'}
 
 USER 2:
 - Name: ${user2.name || 'Unknown'}
 - Skills: ${(user2.skills || []).join(', ') || 'None listed'}
 - Tech Stack: ${(user2.tech_stack || []).join(', ') || 'None listed'}
 - Experience: ${(user2.experience || []).join(', ') || 'None listed'}
-- School: ${user2.school || 'Not specified'}
-- Location: ${user2.location || 'Not specified'}
+- Bio: ${user2.description || 'No bio provided'}
+- Role: ${user2.role_preference || 'Not specified'}
 
-EVALUATION CRITERIA:
-1. Role Complementarity: How well do their skills complement each other? (e.g., Frontend + Backend = High Score)
-2. Tech Stack Alignment: Can they work together effectively?
-3. Project Experience: Do their experiences align for hackathon success?
+SCORING RULES (BE STRICT):
+1. Score ABOVE 90%: Skills are PERFECTLY complementary (e.g., Frontend + Backend, Designer + Developer)
+2. Score 60-85%: Skills are somewhat complementary but not perfect
+3. Score BELOW 40%: Skills are nearly IDENTICAL (avoid duplication)
+4. DO NOT give scores around 50% - be decisive!
 
-Respond with a JSON object in this exact format:
+Respond with ONLY a JSON object (no markdown, no code blocks):
 {
   "score": <number 0-100>,
-  "reason": "<brief explanation of why this is a good/bad match>",
-  "category": "<Strong|Good|Okay|Bad>"
+  "reason": "<brief explanation>",
+  "category": "<Strong Match|Good Match|Okay Match>"
 }`;
+      }
     }
 
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const text = response.text().trim();
-    
+    console.log(`🤖 Calling Gemini API for match: ${user1.name || user1._id} vs ${user2.name || user2._id}`);
+
+    let result;
+    let response;
+    let text;
+
+    try {
+      result = await model.generateContent(prompt);
+      response = await result.response;
+      text = response.text().trim();
+
+      console.log(`✅ Gemini API response received (length: ${text.length})`);
+      console.log(`📝 Raw response preview: ${text.substring(0, 200)}...`);
+    } catch (apiError) {
+      console.error('❌ Gemini API call failed:', apiError);
+      throw new Error(`Gemini API error: ${apiError.message}`);
+    }
+
     // Try to parse JSON from response
     let matchData;
     try {
-      // Extract JSON from markdown code blocks if present
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      // Remove markdown code blocks if present
+      let cleanedText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+      // Extract JSON from text
+      const jsonMatch = cleanedText.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         matchData = JSON.parse(jsonMatch[0]);
       } else {
-        matchData = JSON.parse(text);
+        matchData = JSON.parse(cleanedText);
       }
-    } catch (e) {
-      console.warn('Failed to parse AI response as JSON, using fallback');
-      matchData = {
-        score: 50,
-        reason: 'AI response parsing failed',
-        category: 'Okay'
-      };
+
+      console.log(`✅ Parsed match data:`, matchData);
+    } catch (parseError) {
+      console.error('❌ Failed to parse AI response as JSON:', parseError.message);
+      console.error('📝 Raw response:', text);
+      // Don't default to 50 - throw error instead
+      throw new Error(`Failed to parse Gemini response: ${parseError.message}. Raw response: ${text.substring(0, 500)}`);
     }
-    
+
+    // Validate score exists and is a number
+    if (typeof matchData.score !== 'number' && typeof matchData.score !== 'string') {
+      console.error('❌ Invalid score in response:', matchData);
+      throw new Error(`Invalid score format in Gemini response: ${JSON.stringify(matchData)}`);
+    }
+
     // Validate and normalize score
-    const score = Math.max(0, Math.min(100, parseInt(matchData.score) || 50));
-    
-    // Determine category based on score
-    let category = matchData.category || 'Okay';
-    if (score >= 85) {
-      category = 'Strong';
+    const score = Math.max(0, Math.min(100, parseInt(matchData.score) || 0));
+
+    if (score === 0 && !matchData.score) {
+      console.error('❌ Score is 0 or missing:', matchData);
+      throw new Error(`Score is missing or invalid in response: ${JSON.stringify(matchData)}`);
+    }
+
+    console.log(`📊 Final match score: ${score}%`);
+
+    // Normalize category to match expected format
+    let category = matchData.category || 'Okay Match';
+    if (score >= 90) {
+      category = 'Strong Match';
     } else if (score >= 60) {
-      category = 'Good';
-    } else if (score >= 40) {
-      category = 'Okay';
+      category = 'Good Match';
     } else {
-      category = 'Bad';
+      category = 'Okay Match';
     }
     
     return {
@@ -222,12 +444,12 @@ app.get('/hackathons', async (req, res) => {
     console.log('Fetching hackathons from MongoDB...');
     const hackathons = await Hackathon.find();
     console.log(`Found ${hackathons.length} hackathons in database`);
-    
+
     // Map to frontend format
     const formatted = hackathons.map(hackathon => {
       let start_date = null;
       let end_date = null;
-      
+
       if (hackathon.startDate) {
         try {
           start_date = new Date(hackathon.startDate).toISOString().split('T')[0];
@@ -235,7 +457,7 @@ app.get('/hackathons', async (req, res) => {
           console.warn('Invalid startDate format:', hackathon.startDate);
         }
       }
-      
+
       if (hackathon.endDate) {
         try {
           end_date = new Date(hackathon.endDate).toISOString().split('T')[0];
@@ -243,7 +465,7 @@ app.get('/hackathons', async (req, res) => {
           console.warn('Invalid endDate format:', hackathon.endDate);
         }
       }
-      
+
       return {
         id: hackathon._id.toString(),
         name: hackathon.name || 'Hackathon Event',
@@ -262,7 +484,7 @@ app.get('/hackathons', async (req, res) => {
       if (!b.start_date) return -1;
       return new Date(a.start_date) - new Date(b.start_date);
     });
-    
+
     res.json(formatted);
   } catch (error) {
     console.error('Error fetching hackathons:', error);
@@ -275,13 +497,69 @@ app.get('/', (req, res) => {
   res.json({ message: 'Hackathon Team Matcher API is running!' });
 });
 
-// GET all users
+// Health check with route list
+app.get('/health', (req, res) => {
+  const routes = [];
+  app._router.stack.forEach((middleware) => {
+    if (middleware.route) {
+      const methods = Object.keys(middleware.route.methods).map(m => m.toUpperCase()).join(', ');
+      routes.push(`${methods} ${middleware.route.path}`);
+    }
+  });
+  res.json({
+    status: 'ok',
+    routes: routes.filter(r => r.includes('match-score') || r.includes('team') || r.includes('/users'))
+  });
+});
+
+// Test endpoint to verify match-score route exists
+app.get('/test-match-score', (req, res) => {
+  res.json({ message: 'Match-score route is accessible', path: '/match-score' });
+});
+
+// GET all users (optionally filtered by hackathon registration)
 app.get('/users', async (req, res) => {
+  const { hackathonId } = req.query;
+  const currentUserId = '6958c084d6d4ea1f109dad70'; // Hardcoded current user ID
+
   try {
-    const users = await User.find();
+    // Ensure hackathonId is treated as a string (as stored in registered_hackathons array)
+    const hackathonIdString = hackathonId ? String(hackathonId) : null;
+
+    // Build query: filter by hackathon registration if hackathonId is provided
+    // registered_hackathons is an array of strings, so direct equality works
+    const query = hackathonIdString
+      ? {
+        registered_hackathons: hackathonIdString,
+        _id: { $ne: currentUserId }
+      }
+      : {
+        _id: { $ne: currentUserId }
+      };
+
+    if (hackathonIdString) {
+      console.log("🔍 Filtering users for hackathon ID (as string):", hackathonIdString);
+      console.log("📋 Query:", JSON.stringify(query, null, 2));
+    } else {
+      console.log("⚠️ No hackathonId provided, returning all users (excluding current user)");
+    }
+
+    const users = await User.find(query);
+    console.log(`✅ Found ${users.length} users${hackathonIdString ? ` registered for hackathon ${hackathonIdString}` : ' (all users)'}`);
+
+    // Verify filtering worked by checking first few users
+    if (users.length > 0 && hackathonIdString) {
+      console.log("📋 Verification - First 3 users' registered_hackathons:");
+      users.slice(0, 3).forEach((user, i) => {
+        const hasHackathon = user.registered_hackathons?.includes(hackathonIdString);
+        console.log(`   ${i + 1}. ${user.name}: [${user.registered_hackathons?.join(', ') || 'none'}] - Contains hackathonId: ${hasHackathon}`);
+      });
+    }
+
     res.json(users);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    console.error('❌ Error fetching users:', err);
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -329,33 +607,364 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
+// Helper function to fetch GitHub data
+async function fetchGithubData(username) {
+  try {
+    console.log('📋 Fetching GitHub repos for:', username);
+    const response = await axios.get(`https://api.github.com/users/${username}/repos?per_page=100`);
+    const repos = response.data.map(repo => ({
+      name: repo.name,
+      description: repo.description || '',
+      language: repo.language || 'N/A',
+      topics: repo.topics || []
+    }));
+    return JSON.stringify(repos);
+  } catch (error) {
+    console.error('❌ GitHub API error:', error.message);
+    throw new Error('GitHub profile not found or private.');
+  }
+}
+
+// POST /api/onboarding/analyze - AI Profiler for GitHub/Resume
+app.post('/api/onboarding/analyze', async (req, res) => {
+  try {
+    console.log('🔍 POST /api/onboarding/analyze - Request received');
+    console.log('📋 Request body keys:', Object.keys(req.body));
+    
+    // Check if API key is set
+    if (!process.env.GEMINI_API_KEY) {
+      console.error('❌ GEMINI_API_KEY is not set');
+      return res.status(500).json({ error: 'AI service is not configured. Please set GEMINI_API_KEY in .env file.' });
+    }
+    
+    const { githubUrl, resumeText, resumeBase64 } = req.body;
+    
+    if (!githubUrl && !resumeText && !resumeBase64) {
+      console.error('❌ Missing required fields');
+      return res.status(400).json({ error: 'Either githubUrl, resumeText, or resumeBase64 is required' });
+    }
+    
+    // Try to get a working model
+    let model;
+    try {
+      model = await getWorkingModel();
+      console.log('✅ Gemini model initialized successfully');
+    } catch (modelError) {
+      console.error('❌ Error finding working Gemini model:', modelError);
+      return res.status(500).json({ 
+        error: 'No working Gemini models found. Please check your GEMINI_API_KEY and ensure you have access to Gemini models.', 
+        details: modelError.message 
+      });
+    }
+    let dataToAnalyze = '';
+    
+    // Handle GitHub URL
+    if (githubUrl) {
+      try {
+        // Extract username from GitHub URL
+        const username = githubUrl.replace(/https?:\/\/(www\.)?github\.com\//, '').split('/')[0].split('?')[0];
+        console.log('📋 Extracted username:', username);
+        
+        dataToAnalyze = await fetchGithubData(username);
+        console.log('✅ GitHub data fetched successfully');
+      } catch (githubError) {
+        console.error('❌ Error fetching GitHub data:', githubError);
+        return res.status(400).json({ error: githubError.message || 'Failed to fetch GitHub data. Check the URL.' });
+      }
+    }
+    
+    // Handle Resume (text or base64 PDF)
+    if (resumeText || resumeBase64) {
+      if (resumeBase64) {
+        try {
+          // Try to use pdf-parse if available, otherwise fallback to text extraction
+          let pdfParse;
+          try {
+            pdfParse = (await import('pdf-parse')).default;
+          } catch (e) {
+            console.log('⚠️ pdf-parse not available, using text fallback');
+            pdfParse = null;
+          }
+          
+          if (pdfParse) {
+            // Decode base64 and parse PDF
+            const pdfBuffer = Buffer.from(resumeBase64, 'base64');
+            const pdfData = await pdfParse(pdfBuffer);
+            dataToAnalyze = pdfData.text;
+            console.log('✅ PDF parsed successfully (length:', dataToAnalyze.length, ')');
+          } else {
+            // Fallback: try to extract text from base64
+            dataToAnalyze = resumeText || Buffer.from(resumeBase64, 'base64').toString('utf-8');
+            console.log('⚠️ Using text fallback for resume (length:', dataToAnalyze.length, ')');
+          }
+        } catch (pdfError) {
+          console.error('❌ Error parsing PDF:', pdfError);
+          // Fallback to text if PDF parsing fails
+          dataToAnalyze = resumeText || Buffer.from(resumeBase64, 'base64').toString('utf-8');
+        }
+      } else {
+        dataToAnalyze = resumeText;
+      }
+      console.log('📋 Analyzing resume text (length:', dataToAnalyze.length, ')');
+    }
+    
+    // Improved Gemini prompt
+    const prompt = `Analyze the following data: ${dataToAnalyze}
+
+Extract the following into a JSON object:
+- name: (String, full name if available)
+- email: (String, email if available, otherwise empty string)
+- role_preference: (String, one of: Frontend, Backend, Full Stack, Mobile, AI/ML, DevOps, Design)
+- skills: (Array of Strings, e.g., ["React", "Node.js", "Python"])
+- tech_stack: (Array of Strings, top 5-10 languages/frameworks/tools)
+- experience: (Array of Strings, job titles and companies, e.g., ["Software Engineer @ Company"])
+- school: (String, university/school name)
+- location: (String, city, state or city, country)
+- github: (String, GitHub username only, no URL)
+- devpost: (String, Devpost username if available, otherwise empty)
+- description: (String, short 2-sentence professional bio about their interests/goals)
+- num_hackathons: (String, number as string, e.g., "5", infer from projects/hackathon mentions)
+
+Return ONLY raw JSON, no markdown code blocks.`;
+
+    console.log('🤖 Calling Gemini API...');
+    console.log('📝 Prompt length:', prompt.length);
+    
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text().trim();
+    
+    console.log('✅ Gemini API response received (length:', text.length, ')');
+    console.log('📝 Raw response preview:', text.substring(0, 200));
+    
+    // Parse JSON from response
+    let userData;
+    try {
+      // Remove markdown code blocks
+      const cleanedText = text.replace(/```json|```/g, '').trim();
+      const jsonMatch = cleanedText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        userData = JSON.parse(jsonMatch[0]);
+      } else {
+        userData = JSON.parse(cleanedText);
+      }
+      
+      console.log('✅ AI profile analysis complete');
+      console.log('📋 Extracted data:', JSON.stringify(userData, null, 2));
+    } catch (parseError) {
+      console.error('❌ Failed to parse AI response:', parseError);
+      console.error('Raw response:', text);
+      return res.status(500).json({ 
+        error: 'AI Analysis failed. Could not parse response.', 
+        details: text.substring(0, 500),
+        parseError: parseError.message
+      });
+    }
+    
+    res.json(userData);
+  } catch (error) {
+    console.error('❌ Error in /api/onboarding/analyze:', error);
+    console.error('Error name:', error.name);
+    console.error('Error message:', error.message);
+    console.error('Error stack:', error.stack);
+    
+    // Provide more specific error messages
+    let errorMessage = 'AI Analysis failed.';
+    if (error.message && error.message.includes('API_KEY')) {
+      errorMessage = 'Invalid or missing GEMINI_API_KEY. Please check your .env file.';
+    } else if (error.message && (error.message.includes('404') || error.message.includes('not found'))) {
+      errorMessage = 'Gemini model not found. The API may have changed.';
+    } else if (error.message && (error.message.includes('quota') || error.message.includes('limit'))) {
+      errorMessage = 'API quota exceeded. Please check your Google Cloud billing.';
+    } else {
+      errorMessage = error.message || 'AI Analysis failed. Check your API Key or Input.';
+    }
+    
+    res.status(500).json({ 
+      error: errorMessage,
+      details: error.message,
+      name: error.name
+    });
+  }
+});
+
+// PUT /api/users/:id - Update or create user profile (for onboarding save)
+app.put('/api/users/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userData, selectedHackathons } = req.body;
+    
+    console.log('💾 Saving user profile for ID:', id);
+    console.log('📋 User data:', userData);
+    console.log('📋 Selected hackathons:', selectedHackathons);
+    
+    if (!userData || !userData.name) {
+      return res.status(400).json({ error: 'User data with name is required' });
+    }
+    
+    // Prepare user data
+    const userToSave = {
+      ...userData,
+      registered_hackathons: selectedHackathons || []
+    };
+    
+    // Try to find existing user first
+    let existingUser = await User.findById(id);
+    
+    if (existingUser) {
+      // Update existing user
+      Object.assign(existingUser, userToSave);
+      await existingUser.save();
+      console.log('✅ User profile updated successfully:', existingUser._id);
+      res.status(200).json({
+        success: true,
+        user: existingUser,
+        message: 'Profile updated successfully'
+      });
+    } else {
+      // Create new user with the provided ID (or let MongoDB generate one)
+      // If the ID is the hardcoded demo ID, use it; otherwise create new
+      let newUser;
+      if (id === '6958c084d6d4ea1f109dad70') {
+        // Use the hardcoded ID for demo
+        newUser = await User.create({
+          _id: id,
+          ...userToSave
+        });
+      } else {
+        // Create new user (MongoDB will generate ID)
+        newUser = await User.create(userToSave);
+      }
+      
+      console.log('✅ New user profile created successfully:', newUser._id);
+      res.status(201).json({
+        success: true,
+        user: newUser,
+        message: 'Profile created successfully'
+      });
+    }
+  } catch (error) {
+    console.error('❌ Error saving user profile:', error);
+    res.status(500).json({ error: error.message || 'Save failed' });
+  }
+});
+
+// POST /api/onboarding/save - Save user profile (backward compatibility)
+app.post('/api/onboarding/save', async (req, res) => {
+  try {
+    const { userData, selectedHackathons } = req.body;
+    
+    // Hardcoded user ID for demo
+    const userId = '6958c084d6d4ea1f109dad70';
+    
+    console.log('💾 Saving user profile (POST /api/onboarding/save)...');
+    console.log('📋 User data:', userData);
+    console.log('📋 Selected hackathons:', selectedHackathons);
+    
+    if (!userData || !userData.name) {
+      return res.status(400).json({ error: 'User data with name is required' });
+    }
+    
+    // Prepare user data
+    const userToSave = {
+      ...userData,
+      registered_hackathons: selectedHackathons || []
+    };
+    
+    // Try to find existing user first
+    let existingUser = await User.findById(userId);
+    
+    if (existingUser) {
+      // Update existing user
+      Object.assign(existingUser, userToSave);
+      await existingUser.save();
+      console.log('✅ User profile updated successfully:', existingUser._id);
+    } else {
+      // Create new user with the hardcoded ID
+      existingUser = await User.create({
+        _id: userId,
+        ...userToSave
+      });
+      console.log('✅ New user profile created successfully:', existingUser._id);
+    }
+    
+    res.json({ 
+      success: true, 
+      userId: existingUser._id,
+      message: 'Profile saved successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error saving user profile:', error);
+    res.status(500).json({ error: error.message || 'Update failed' });
+  }
+});
+
 // POST /match-score - AI Matchmaking endpoint
 app.post('/match-score', async (req, res) => {
   try {
-    const { user1_id, user2_id, team_member_ids, hackathon_id } = req.body;
-    
-    if (!user1_id || !user2_id) {
-      return res.status(400).json({ error: 'user1_id and user2_id are required' });
+    let { currentUser, targetUser, user1_id, user2_id, team_member_ids } = req.body;
+
+    console.log(`🔍 POST /match-score request received`);
+
+    // 1. Resolve Users: Handle both Direct Objects (from Prompt) and IDs (from Frontend)
+    if (!currentUser && user1_id) {
+      currentUser = await User.findById(user1_id) || await User.findOne({ _id: user1_id });
     }
-    
-    const user1 = await User.findById(user1_id);
-    const user2 = await User.findById(user2_id);
-    
-    if (!user1 || !user2) {
-      return res.status(404).json({ error: 'One or both users not found' });
+    if (!targetUser && user2_id) {
+      targetUser = await User.findById(user2_id) || await User.findOne({ _id: user2_id });
     }
-    
-    let teamMembers = null;
-    if (team_member_ids && team_member_ids.length > 0) {
-      // Fetch team members for team-based matching
-      teamMembers = await User.find({ _id: { $in: team_member_ids } });
+
+    // Validation
+    if (!currentUser || !targetUser) {
+      console.error('❌ Missing users for matchmaking');
+      return res.status(404).json({ error: 'Users not found', details: 'Provide currentUser/targetUser objects OR user1_id/user2_id' });
     }
+
+    console.log(`✅ Matchmaking for: ${currentUser.name} vs ${targetUser.name}`);
+
+    // 2. Prepare Matchmaking Logic
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+    // Construct the requested System Prompt
+    const prompt = `You are a hackathon matchmaking agent. Compare the skills and roles of User A and User B. 
     
-    const matchResult = await calculateMatchScore(user1, user2, teamMembers);
+    User A (Current User):
+    - Role: ${currentUser.role_preference || 'Unspecified'}
+    - Skills: ${Array.isArray(currentUser.skills) ? currentUser.skills.join(', ') : currentUser.skills || 'None'}
+    - Tech Stack: ${Array.isArray(currentUser.tech_stack) ? currentUser.tech_stack.join(', ') : currentUser.tech_stack || 'None'}
     
-    res.json(matchResult);
+    User B (Target User):
+    - Role: ${targetUser.role_preference || 'Unspecified'}
+    - Skills: ${Array.isArray(targetUser.skills) ? targetUser.skills.join(', ') : targetUser.skills || 'None'}
+    - Tech Stack: ${Array.isArray(targetUser.tech_stack) ? targetUser.tech_stack.join(', ') : targetUser.tech_stack || 'None'}
+
+    If User A is a VR/Mobile dev (Unity/Swift) and User B is a Backend/Cloud dev (Go/Node/Kubernetes), give a score > 90%. 
+    If they overlap (both Unity), give a score < 40%. 
+    
+    Return ONLY JSON: {"score": number, "reason": "string", "category": "Strong Match|Good Match|Okay Match"}`;
+
+    // 3. Call Gemini API
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text().trim();
+
+    console.log(`🤖 Gemini JSON Response: ${text}`);
+
+    // 4. Parse JSON Securely
+    let matchData;
+    try {
+      const cleanedText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      matchData = JSON.parse(cleanedText);
+    } catch (parseError) {
+      console.error('❌ Failed to parse Gemini response:', text);
+      // Fallback if AI fails to return valid JSON
+      return res.json({ score: 50, reason: "AI response error, defaulting score.", category: "Okay Match" });
+    }
+
+    res.json(matchData);
+
   } catch (error) {
-    console.error('Error in match-score:', error);
+    console.error('❌ Error in POST /match-score:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -363,25 +972,27 @@ app.post('/match-score', async (req, res) => {
 // POST request to send team request
 app.post('/request', async (req, res) => {
   try {
-    const { from_user_id, to_user_id, message } = req.body;
-    
-    // Check if user already sent 5 requests
-    const requestCount = await Request.countDocuments({ 
-      from_user_id, 
-      status: 'pending' 
+    const { from_user_id, to_user_id, message, hackathon_id } = req.body;
+
+    // Check if user already sent 5 requests for this hackathon
+    const requestCount = await Request.countDocuments({
+      from_user_id,
+      hackathon_id: hackathon_id || null,
+      status: 'pending'
     });
-    
+
     if (requestCount >= 5) {
       return res.status(400).json({ error: 'Maximum 5 requests allowed' });
     }
-    
+
     const newRequest = await Request.create({
       from_user_id,
       to_user_id,
+      hackathon_id: hackathon_id || null,
       message: message || '',
       status: 'pending'
     });
-    
+
     res.json(newRequest);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -389,19 +1000,36 @@ app.post('/request', async (req, res) => {
 });
 
 // GET /team/:userId - Get user's team
+// GET /team/:userId - Get user's team
 app.get('/team/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-    const team = await Team.findOne({ members: userId, is_full: false });
-    
-    if (!team) {
-      return res.json({ team: null, needed_roles: [] });
+
+    console.log(`🔍 GET /team/:userId - userId: ${userId}`);
+
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
     }
-    
+
+    // Find team where user is a member (check both string and ObjectId)
+    const team = await Team.findOne({
+      members: { $in: [userId, new mongoose.Types.ObjectId(userId)] },
+      is_full: false
+    });
+
+    console.log(`📋 Team found: ${!!team}`);
+
+    if (!team) {
+      console.log(`✅ User ${userId} is not in any team`);
+      return res.status(200).json({ team: null, needed_roles: [] });
+    }
+
     // Get team members details
     const members = await User.find({ _id: { $in: team.members } });
-    
-    res.json({
+
+    console.log(`✅ Team found with ${members.length} members`);
+
+    res.status(200).json({
       team: {
         ...team.toObject(),
         members_details: members
@@ -409,6 +1037,7 @@ app.get('/team/:userId', async (req, res) => {
       needed_roles: team.needed_roles || []
     });
   } catch (error) {
+    console.error('❌ Error in GET /team/:userId:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -417,27 +1046,27 @@ app.get('/team/:userId', async (req, res) => {
 app.post('/team', async (req, res) => {
   try {
     const { hackathon_id, user_id } = req.body;
-    
+
     if (!hackathon_id || !user_id) {
       return res.status(400).json({ error: 'hackathon_id and user_id are required' });
     }
-    
+
     // Check if user is already in a team
-    const existingTeam = await Team.findOne({ 
-      members: user_id, 
-      is_full: false 
+    const existingTeam = await Team.findOne({
+      members: user_id,
+      is_full: false
     });
-    
+
     if (existingTeam) {
       return res.json(existingTeam);
     }
-    
+
     // Create new team or join existing
-    let team = await Team.findOne({ 
-      hackathon_id, 
-      is_full: false 
+    let team = await Team.findOne({
+      hackathon_id,
+      is_full: false
     });
-    
+
     if (!team) {
       team = await Team.create({
         hackathon_id,
@@ -452,12 +1081,12 @@ app.post('/team', async (req, res) => {
       team.members.push(user_id);
       await team.save();
     }
-    
+
     // Check if team is now full (4 members)
     if (team.members.length === 4) {
       team.is_full = true;
       await team.save();
-      
+
       // Auto-cancel all pending requests for these 4 users
       await Request.updateMany(
         {
@@ -469,7 +1098,7 @@ app.post('/team', async (req, res) => {
         { status: 'cancelled' }
       );
     }
-    
+
     res.json(team);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -556,8 +1185,113 @@ app.get('/test', async (req, res) => {
   res.json(users);
 });
 
+// Test endpoint - Test Gemini API key and models
+app.get('/test-gemini', async (req, res) => {
+  try {
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ 
+        error: 'GEMINI_API_KEY not set',
+        help: 'Add GEMINI_API_KEY to your .env file. Get one at https://aistudio.google.com/apikey'
+      });
+    }
+    
+    console.log('🔍 Testing Gemini API key...');
+    console.log('📋 API Key length:', process.env.GEMINI_API_KEY.length);
+    console.log('📋 API Key preview:', process.env.GEMINI_API_KEY.substring(0, 10) + '...');
+    
+    const testPrompt = 'Say "Hello"';
+    // Try the most basic model first - gemini-pro should always work
+    const modelsToTry = [
+      'gemini-2.5-flash',        // Latest flash model
+      'gemini-2.5-pro',          // Latest pro model
+      'gemini-pro',              // Original model (fallback)
+      'gemini-1.5-pro',
+      'gemini-2.5-flash'  // Fallback to latest if others fail
+    ];
+    
+    const results = [];
+    for (const modelName of modelsToTry) {
+      try {
+        console.log(`🔍 Testing ${modelName}...`);
+        const model = genAI.getGenerativeModel({ model: modelName });
+        const result = await model.generateContent(testPrompt);
+        const response = await result.response;
+        const text = response.text();
+        results.push({ model: modelName, status: '✅ Working', response: text.substring(0, 50) });
+        console.log(`✅ ${modelName} works!`);
+        // If we find a working model, we can stop early
+        break;
+      } catch (error) {
+        const errorMsg = error.message || error.toString();
+        const errorDetails = {
+          model: modelName, 
+          status: '❌ Failed', 
+          error: errorMsg.substring(0, 300),
+          is404: errorMsg.includes('404'),
+          isAuth: errorMsg.includes('401') || errorMsg.includes('403')
+        };
+        results.push(errorDetails);
+        console.log(`❌ ${modelName} failed: ${errorMsg.substring(0, 150)}`);
+      }
+    }
+    
+    const workingModels = results.filter(r => r.status === '✅ Working');
+    const authErrors = results.filter(r => r.isAuth);
+    const all404 = results.every(r => r.is404);
+    
+    if (workingModels.length === 0) {
+      let helpMessage = 'Your API key may be invalid or not have access to Gemini models.';
+      if (authErrors.length > 0) {
+        helpMessage = 'Your API key appears to be invalid or unauthorized. Please get a new key from https://aistudio.google.com/apikey';
+      } else if (all404) {
+        helpMessage = 'All models returned 404. This might mean:\n1. Your API key doesn\'t have access to Gemini models\n2. The models are not available in your region\n3. You need to enable the Generative Language API in Google Cloud Console\n\nGet a new API key at https://aistudio.google.com/apikey and make sure to enable the API.';
+      }
+      
+      return res.status(500).json({
+        error: 'No working models found',
+        results: results,
+        help: helpMessage,
+        troubleshooting: {
+          apiKeyLength: process.env.GEMINI_API_KEY.length,
+          allModels404: all404,
+          hasAuthErrors: authErrors.length > 0
+        }
+      });
+    }
+    
+    res.json({
+      success: true,
+      workingModels: workingModels.map(m => m.model),
+      allResults: results,
+      message: `Found ${workingModels.length} working model(s)`
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message, stack: error.stack });
+  }
+});
+
+// 404 handler for undefined routes (must be after all routes)
+app.use((req, res) => {
+  console.log(`❌ 404 - Route not found: ${req.method} ${req.path}`);
+  res.status(404).json({
+    error: 'Route not found',
+    method: req.method,
+    path: req.path
+  });
+});
+
 // Start server
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`✅ Server running on http://localhost:${PORT}`);
+  console.log(`📋 Available routes:`);
+  console.log(`   GET  /users?hackathonId=...`);
+  console.log(`   GET  /team/:userId`);
+  console.log(`   POST /match-score`);
+  console.log(`   POST /request`);
+  console.log(`   POST /api/onboarding/analyze`);
+  console.log(`   PUT  /api/users/:id`);
+  console.log(`   GET  /hackathons`);
+  console.log(`   POST /team`);
+  console.log(`\n✅ All routes registered successfully!`);
 });
 

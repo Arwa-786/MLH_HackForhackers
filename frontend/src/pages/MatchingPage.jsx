@@ -24,7 +24,7 @@ export default function MatchingPage() {
   const [showMessageModal, setShowMessageModal] = useState(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [selectedUser, setSelectedUser] = useState(null);
-  const [currentUserId, setCurrentUserId] = useState(null);
+  const CURRENT_USER_ID = '6958c084d6d4ea1f109dad70'; // Hardcoded current user ID
   const [team, setTeam] = useState(null);
   const [neededRoles, setNeededRoles] = useState([]);
   const [matchScores, setMatchScores] = useState({});
@@ -33,40 +33,48 @@ export default function MatchingPage() {
   useEffect(() => {
     fetchUsers();
     fetchTeam();
-  }, []);
+  }, [hackathonId]); // Re-fetch when hackathonId changes
 
   useEffect(() => {
-    applyFilters();
-  }, [filters, users]);
+    if (users.length > 0) {
+      applyFilters();
+    }
+  }, [filters, users, selectedRoles, selectedTechStack]);
 
   useEffect(() => {
-    if (users.length > 0 && currentUserId) {
+    if (users.length > 0) {
       calculateMatchScores();
     }
-  }, [users.length, team, currentUserId]);
+  }, [users.length, team]);
 
   const fetchUsers = async () => {
     try {
-      const response = await axios.get('http://localhost:3000/users');
-      const fetchedUsers = response.data;
+      setLoading(true);
+      console.log('🔍 Fetching users for hackathon:', hackathonId);
+      
+      // Fetch users registered for this hackathon, excluding current user
+      const response = await axios.get('http://localhost:3000/users', {
+        params: { hackathonId: hackathonId || undefined }
+      });
+      
+      const fetchedUsers = response.data || [];
+      console.log(`✅ Fetched ${fetchedUsers.length} users`);
+      
       setUsers(fetchedUsers);
       setFilteredUsers(fetchedUsers);
-      
-      // Set first user as current user if not set
-      if (!currentUserId && fetchedUsers.length > 0) {
-        setCurrentUserId(fetchedUsers[0]._id);
-      }
-      
       setLoading(false);
     } catch (error) {
-      console.error('Error:', error);
+      console.error('❌ Error fetching users:', error);
+      console.error('Error details:', error.response?.data || error.message);
+      setUsers([]);
+      setFilteredUsers([]);
       setLoading(false);
     }
   };
 
   const fetchTeam = async () => {
     try {
-      const response = await axios.get(`http://localhost:3000/team/${currentUserId}`);
+      const response = await axios.get(`http://localhost:3000/team/${CURRENT_USER_ID}`);
       if (response.data.team) {
         setTeam(response.data.team);
         setNeededRoles(response.data.needed_roles || []);
@@ -77,26 +85,21 @@ export default function MatchingPage() {
   };
 
   const calculateMatchScores = async () => {
-    // Get the first user as current user (or use a real user ID from auth)
-    const currentUser = users.find(u => u._id === currentUserId) || users[0];
-    if (!currentUser || users.length < 2) {
-      console.log('Not enough users to calculate scores');
-      return;
-    }
+    if (users.length === 0) return;
 
     const teamMemberIds = team?.members || [];
     const calculating = new Set();
 
-    // Calculate scores for all users except current user
+    // Calculate scores for all users (current user is hardcoded)
     const scorePromises = users
-      .filter(user => user._id !== currentUser._id)
+      .filter(user => user._id !== CURRENT_USER_ID)
       .map(async (user) => {
         calculating.add(user._id);
         setCalculatingScores(new Set(calculating));
 
         try {
           const response = await axios.post('http://localhost:3000/match-score', {
-            user1_id: currentUser._id,
+            user1_id: CURRENT_USER_ID,
             user2_id: user._id,
             team_member_ids: teamMemberIds,
             hackathon_id: hackathonId
@@ -193,9 +196,10 @@ export default function MatchingPage() {
 
     try {
       await axios.post('http://localhost:3000/request', {
-        from_user_id: currentUserId,
+        from_user_id: CURRENT_USER_ID,
         to_user_id: selectedUserId,
-        message: requestMessage || 'Hello, I would like to team up with you for the hackathon!'
+        message: requestMessage || 'Hello, I would like to team up with you for the hackathon!',
+        hackathon_id: hackathonId
       });
       setRequestsSent(prev => prev + 1);
       setShowMessageModal(false);
@@ -467,7 +471,7 @@ export default function MatchingPage() {
             </div>
           ) : (
             filteredUsers
-              .filter(user => user._id !== currentUserId)
+              .filter(user => user._id !== CURRENT_USER_ID)
               .sort((a, b) => {
                 const scoreA = matchScores[a._id]?.score || 0;
                 const scoreB = matchScores[b._id]?.score || 0;
@@ -495,20 +499,37 @@ export default function MatchingPage() {
                       <Avatar name={user.name} size={80} />
                     </div>
 
-                    {/* Middle: Bio, Tech Stack, School, Location */}
+                    {/* Middle: Name/School/Location (top), Bio (middle), Tech Stack (bottom) */}
                     <div className="flex-1 min-w-0">
-                      <h3 className="text-xl font-bold text-white mb-2 hover:text-[#3b82f6] transition-colors">
-                        {user.name}
-                      </h3>
+                      {/* Top: Name, School, Location */}
+                      <div className="mb-3">
+                        <h3 className="text-xl font-bold text-white mb-1 hover:text-[#3b82f6] transition-colors">
+                          {user.name}
+                        </h3>
+                        <div className="flex items-center gap-4 text-sm text-white/60">
+                          {user.school && (
+                            <span className="flex items-center gap-1">
+                              <span>🏫</span>
+                              {user.school}
+                            </span>
+                          )}
+                          {user.location && (
+                            <span className="flex items-center gap-1">
+                              <span>📍</span>
+                              {user.location}
+                            </span>
+                          )}
+                        </div>
+                      </div>
                       
-                      {/* Bio Preview */}
+                      {/* Middle: Bio Preview (2 lines) */}
                       <p className="text-white/70 text-sm mb-3 line-clamp-2">
                         {bioPreview}
                       </p>
 
-                      {/* Top 3 Tech Stack */}
+                      {/* Bottom: Top 3 Tech Stack Pills */}
                       {topTechStack.length > 0 && (
-                        <div className="flex flex-wrap gap-2 mb-3">
+                        <div className="flex flex-wrap gap-2">
                           {topTechStack.map((tech, i) => (
                             <span
                               key={i}
@@ -522,22 +543,6 @@ export default function MatchingPage() {
                           )}
                         </div>
                       )}
-
-                      {/* School and Location */}
-                      <div className="flex items-center gap-4 text-sm text-white/60">
-                        {user.school && (
-                          <span className="flex items-center gap-1">
-                            <span>🏫</span>
-                            {user.school}
-                          </span>
-                        )}
-                        {user.location && (
-                          <span className="flex items-center gap-1">
-                            <span>📍</span>
-                            {user.location}
-                          </span>
-                        )}
-                      </div>
                     </div>
 
                     {/* Right: Score Ring and View Profile Button */}
@@ -576,7 +581,7 @@ export default function MatchingPage() {
 
         {/* Profile Modal */}
         {showProfileModal && selectedUser && (
-          <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4 overflow-y-auto">
+          <div className="fixed inset-0 bg-black/70 backdrop-blur-md flex items-center justify-center z-50 p-4 overflow-y-auto">
             <div className="bg-[#0a0a0a] border border-white/20 rounded-2xl p-8 max-w-2xl w-full shadow-2xl max-h-[90vh] overflow-y-auto">
               <div className="flex items-start justify-between mb-6">
                 <div className="flex items-center gap-4">
@@ -697,32 +702,30 @@ export default function MatchingPage() {
                 </div>
               )}
 
-              {/* Experience */}
+              {/* Full Experience List */}
               {selectedUser.experience && selectedUser.experience.length > 0 && (
                 <div className="mb-6">
                   <p className="text-white/90 font-semibold mb-3">Experience</p>
-                  <div className="flex flex-wrap gap-2">
+                  <ul className="space-y-2">
                     {selectedUser.experience.map((exp, i) => (
-                      <span
-                        key={i}
-                        className="bg-yellow-500/20 border border-yellow-500/30 text-yellow-400 px-3 py-1 rounded-full text-xs font-medium backdrop-blur-sm"
-                      >
-                        {exp}
-                      </span>
+                      <li key={i} className="text-white/70 text-sm flex items-start">
+                        <span className="mr-2 text-[#3b82f6]">•</span>
+                        <span>{exp}</span>
+                      </li>
                     ))}
-                  </div>
+                  </ul>
                 </div>
               )}
 
-              {/* Message and Send Request */}
+              {/* Personal Message and Send Request */}
               <div className="border-t border-white/10 pt-6 mt-6">
-                <label className="block text-white/90 font-semibold mb-2">Message</label>
+                <label className="block text-white/90 font-semibold mb-2">Personal Message</label>
                 <textarea
                   value={requestMessage}
                   onChange={(e) => setRequestMessage(e.target.value)}
                   placeholder="Enter your message (optional)..."
-                  className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-3 text-white placeholder:text-white/40 focus:outline-none focus:ring-2 focus:ring-[#3b82f6]/50 focus:border-[#3b82f6]/50 transition-all duration-200 mb-4 min-h-[100px] resize-none"
-                  rows={4}
+                  className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-3 text-white placeholder:text-white/40 focus:outline-none focus:ring-2 focus:ring-[#3b82f6]/50 focus:border-[#3b82f6]/50 transition-all duration-200 mb-4 min-h-[120px] resize-none"
+                  rows={5}
                 />
                 <button
                   onClick={handleSendRequestFromModal}
