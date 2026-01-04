@@ -2,23 +2,6 @@
 
 A React application for matching hackathon team members with AI-generated compatibility scores.
 
-[   CLIENT SIDE   ]          [    SERVER SIDE    ]          [   DATA LAYER   ]
-       (React)                    (Node/Express)                 (MongoDB)
-          |                             |                            |
-    +-----+-----+               +-------+-------+             +------+------+
-    | User UI   |-------------->|  REST API     |------------>| Profile Data |
-    +-----------+ (Axios Req)   +-------+-------+ (Mongoose)  +-------------+
-          |                             |
-          |                     +-------+-------+
-          |                     |  AI LOGIC     |
-          +-------------------->| (Match Score) |
-             (Score Display)    +-------+-------+
-                                        |
-    +-----------+               +-------+-------+             +------+------+
-    |  REQUEST  |-------------->|   VALIDATOR   |------------>| LOCALSTORAGE |
-    |  HANDLER  | (POST Req)    | (Limit check) |             | (Req Count)  |
-    +-----------+               +-------+-------+             +--------------+
-
 ## Features
 
 - Fetch user profiles from MongoDB
