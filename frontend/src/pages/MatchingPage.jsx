@@ -4,6 +4,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import ChatPanel from '../components/ChatPanel';
 import GroupsPanel from '../components/GroupsPanel';
 import AIMentorPanel from '../components/AIMentorPanel';
+import RequestsPanel from '../components/RequestsPanel';
 
 export default function MatchingPage() {
   const { hackathonId } = useParams();
@@ -39,45 +40,131 @@ export default function MatchingPage() {
   const [showGroupsPanel, setShowGroupsPanel] = useState(false);
   const [selectedTeam, setSelectedTeam] = useState(null);
   const [showAIMentor, setShowAIMentor] = useState(false);
+  const [showProfileMenu, setShowProfileMenu] = useState(false);
+  const [showRequestsPanel, setShowRequestsPanel] = useState(false);
+  const [hackathons, setHackathons] = useState([]);
 
   useEffect(() => {
     fetchUsers();
     fetchTeam();
     fetchCurrentUser();
     fetchIncomingRequests();
+    fetchHackathons();
   }, [hackathonId]); // Re-fetch when hackathonId changes
 
   const fetchIncomingRequests = async () => {
     try {
+      console.log('📥 [REQUESTS] Fetching incoming requests for user:', CURRENT_USER_ID);
       const response = await axios.get(`http://localhost:3000/api/requests/incoming/${CURRENT_USER_ID}`);
+      console.log('✅ [REQUESTS] Incoming requests response:', response.data);
+      console.log('✅ [REQUESTS] Response length:', response.data?.length || 0);
       setIncomingRequests(response.data || []);
+      console.log('📊 [REQUESTS] Set incomingRequests state:', response.data?.length || 0, 'requests');
     } catch (error) {
-      console.error('Error fetching incoming requests:', error);
+      console.error('❌ [REQUESTS] Error fetching incoming requests:', error);
+      console.error('❌ [REQUESTS] Error response:', error.response?.data);
+      console.error('❌ [REQUESTS] Error message:', error.message);
+      setIncomingRequests([]);
     }
   };
 
   const handleAcceptRequest = async (requestId) => {
     try {
+      console.log('🎉 [ACCEPT] Accepting request:', requestId);
       const response = await axios.post(`http://localhost:3000/requests/${requestId}/accept`, {
         current_user_id: CURRENT_USER_ID
       });
       
-      // Refresh team and requests
-      await fetchTeam();
-      await fetchIncomingRequests();
+      console.log('✅ [ACCEPT] Request accepted, response:', response.data);
+      
+      // Trigger confetti effect immediately
+      const triggerConfetti = () => {
+        if (typeof window !== 'undefined' && window.confetti) {
+          window.confetti({
+            particleCount: 100,
+            spread: 70,
+            origin: { y: 0.6 }
+          });
+        } else {
+          // Fallback: Create simple confetti effect
+          const colors = ['#39ff14', '#00ff00', '#00ff88'];
+          for (let i = 0; i < 50; i++) {
+            setTimeout(() => {
+              const confetti = document.createElement('div');
+              confetti.style.position = 'fixed';
+              confetti.style.left = Math.random() * 100 + '%';
+              confetti.style.top = '-10px';
+              confetti.style.width = '10px';
+              confetti.style.height = '10px';
+              confetti.style.backgroundColor = colors[Math.floor(Math.random() * colors.length)];
+              confetti.style.zIndex = '9999';
+              confetti.style.pointerEvents = 'none';
+              confetti.style.borderRadius = '50%';
+              document.body.appendChild(confetti);
+              
+              const animation = confetti.animate([
+                { transform: 'translateY(0) rotate(0deg)', opacity: 1 },
+                { transform: `translateY(${window.innerHeight + 100}px) rotate(720deg)`, opacity: 0 }
+              ], {
+                duration: 3000,
+                easing: 'cubic-bezier(0.5, 0, 0.5, 1)'
+              });
+              
+              animation.onfinish = () => confetti.remove();
+            }, i * 20);
+          }
+        }
+      };
+      
+      // Trigger confetti immediately
+      triggerConfetti();
+      
+      // Close requests panel first
+      setShowRequestsPanel(false);
       setShowRequestsModal(false);
       
+      // Refresh team and requests
+      try {
+        await fetchTeam();
+        await fetchIncomingRequests();
+      } catch (fetchError) {
+        console.error('⚠️ [ACCEPT] Error refreshing data:', fetchError);
+        // Don't block the flow if refresh fails
+      }
+      
       // Open groups panel and select the new team
-      if (response.data.team) {
+      if (response.data && response.data.team) {
+        console.log('🎉 [ACCEPT] Opening team chat for team:', response.data.team);
         setSelectedTeam(response.data.team);
         setShowGroupsPanel(true);
         setShowChat(true);
+      } else {
+        // If team not in response, fetch it
+        console.log('⚠️ [ACCEPT] Team not in response, fetching...');
+        await fetchTeam();
+        if (team) {
+          setSelectedTeam(team);
+          setShowGroupsPanel(true);
+          setShowChat(true);
+        }
       }
       
-      alert('Request accepted! Team created.');
     } catch (error) {
-      console.error('Error accepting request:', error);
-      alert('Error accepting request: ' + (error.response?.data?.error || error.message));
+      console.error('❌ [ACCEPT] Error accepting request:', error);
+      console.error('❌ [ACCEPT] Error response:', error.response?.data);
+      console.error('❌ [ACCEPT] Error message:', error.message);
+      
+      // Show user-friendly error message
+      const errorMessage = error.response?.data?.error || error.message || 'Failed to accept request';
+      alert(`Error accepting request: ${errorMessage}`);
+      
+      // Still refresh to show updated state
+      try {
+        await fetchIncomingRequests();
+        await fetchTeam();
+      } catch (refreshError) {
+        console.error('⚠️ [ACCEPT] Error refreshing after failure:', refreshError);
+      }
     }
   };
 
@@ -93,6 +180,26 @@ export default function MatchingPage() {
       setCurrentUserName(response.data?.name || 'User');
     } catch (err) {
       console.error('Error fetching current user:', err);
+    }
+  };
+
+  const fetchHackathons = async () => {
+    try {
+      const response = await axios.get('http://localhost:3000/hackathons');
+      setHackathons(response.data || []);
+    } catch (err) {
+      console.error('Error fetching hackathons:', err);
+    }
+  };
+
+  const handleDeclineRequest = async (requestId) => {
+    try {
+      // TODO: Implement decline endpoint if needed
+      // For now, just refresh the requests
+      await fetchIncomingRequests();
+    } catch (error) {
+      console.error('Error declining request:', error);
+      alert('Error declining request: ' + (error.response?.data?.error || error.message));
     }
   };
 
@@ -367,26 +474,93 @@ export default function MatchingPage() {
         <div className="absolute bottom-0 right-0 w-96 h-96 bg-[#39ff14]/5 rounded-full blur-3xl"></div>
       </div>
 
-      {/* Groups Button - Top left, disappears when panel is open */}
-      {!showGroupsPanel && (
-        <button
-          onClick={() => setShowGroupsPanel(true)}
-          className="fixed left-4 top-4 z-40 code-bg p-3 border-2 border-[#39ff14]/50 text-[#39ff14] hover:bg-[#39ff14]/10 hover:border-[#39ff14] transition-all pixel-text font-bold text-sm rounded-lg shadow-lg"
-          title="View Groups"
-        >
-          <div className="flex flex-col items-center gap-1">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-              <circle cx="9" cy="7" r="4"></circle>
-              <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
-              <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
-            </svg>
-            <span className="text-xs">GROUPS</span>
-          </div>
-        </button>
+      {/* Groups Button and Requests Button - Top left, disappears when panels are open */}
+      {!showGroupsPanel && !showRequestsPanel && (
+        <div className="fixed left-4 top-4 z-40 flex flex-col gap-3">
+          <button
+            onClick={() => setShowGroupsPanel(true)}
+            className="code-bg p-3 border-2 border-[#39ff14]/50 text-[#39ff14] hover:bg-[#39ff14]/10 hover:border-[#39ff14] transition-all pixel-text font-bold text-sm rounded-lg shadow-lg"
+            title="View Groups"
+          >
+            <div className="flex flex-col items-center gap-1">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                <circle cx="9" cy="7" r="4"></circle>
+                <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+              </svg>
+              <span className="text-xs">GROUPS</span>
+            </div>
+          </button>
+          
+          {/* Requests Button - Below Groups */}
+          <button
+            onClick={() => {
+              console.log('🔔 [REQUESTS] Button clicked!');
+              console.log('📊 [REQUESTS] Current incomingRequests state:', incomingRequests);
+              console.log('📊 [REQUESTS] incomingRequests.length:', incomingRequests.length);
+              console.log('📊 [REQUESTS] Setting showRequestsPanel to true');
+              setShowRequestsPanel(true);
+              console.log('📊 [REQUESTS] Panel should now be visible');
+            }}
+            className="code-bg p-3 border-2 border-[#39ff14]/50 text-[#39ff14] hover:bg-[#39ff14]/10 hover:border-[#39ff14] transition-all pixel-text font-bold text-sm rounded-lg shadow-lg relative"
+            title="View Requests"
+          >
+            <div className="flex flex-col items-center gap-1 relative">
+              {/* UserPlus Icon */}
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                <circle cx="8.5" cy="7" r="4"></circle>
+                <line x1="20" y1="8" x2="20" y2="14"></line>
+                <line x1="23" y1="11" x2="17" y2="11"></line>
+              </svg>
+              <span className="text-xs">REQUESTS</span>
+              {/* Notification Badge - Red dot when there are pending requests */}
+              {incomingRequests.length > 0 && (
+                <span className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full border-2 border-[#0a0a0a] shadow-[0_0_8px_rgba(239,68,68,0.8)] animate-pulse"></span>
+              )}
+            </div>
+          </button>
+        </div>
       )}
 
-      <div className={`max-w-6xl mx-auto relative z-10 transition-all duration-300 ${showGroupsPanel ? 'ml-80' : ''} ${showAIMentor ? 'mr-96' : ''} ${showChat ? 'opacity-0 pointer-events-none' : ''}`}>
+      {/* Profile Menu - Top Right (only visible when chat is closed) */}
+      {!showChat && (
+        <div className="fixed top-4 right-4 z-40">
+          <button
+            onClick={() => setShowProfileMenu(!showProfileMenu)}
+            className="code-bg px-4 py-2 border-2 border-[#39ff14]/50 text-[#39ff14] hover:bg-[#39ff14]/10 transition-all pixel-text font-bold text-sm flex items-center gap-2"
+          >
+            <span>{currentUserName || 'USER'}</span>
+            <span className="text-[#39ff14]">▼</span>
+          </button>
+          
+          {showProfileMenu && (
+            <div className="absolute right-0 mt-2 code-bg min-w-[200px] border-2 border-[#39ff14]/50 z-50">
+              <button
+                onClick={() => {
+                  navigate('/');
+                  setShowProfileMenu(false);
+                }}
+                className="w-full text-left px-4 py-2 text-white hover:bg-[#39ff14]/20 hover:text-[#39ff14] transition-all pixel-text text-xs"
+              >
+                UPDATE_PROFILE()
+              </button>
+              <button
+                onClick={() => {
+                  navigate('/');
+                  setShowProfileMenu(false);
+                }}
+                className="w-full text-left px-4 py-2 text-white hover:bg-[#39ff14]/20 hover:text-[#39ff14] transition-all pixel-text text-xs border-t-2 border-[#39ff14]/30"
+              >
+                LOGOUT()
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className={`max-w-6xl mx-auto relative z-10 transition-all duration-300 ${showGroupsPanel || showRequestsPanel ? 'ml-[300px]' : ''} ${showAIMentor ? 'mr-96' : ''} ${showChat ? 'opacity-0 pointer-events-none' : ''}`}>
         {/* Back Button */}
         <button
           onClick={() => navigate('/hackathons')}
@@ -410,17 +584,21 @@ export default function MatchingPage() {
                 // REQUESTS: <span className="text-[#39ff14]">{requestsSent}/5</span>
               </p>
             </div>
-            {incomingRequests.length > 0 && (
-              <button
-                onClick={() => setShowRequestsModal(true)}
-                className="code-bg px-4 py-2 border-2 border-[#39ff14]/50 text-[#39ff14] hover:bg-[#39ff14]/10 transition-all pixel-text font-bold text-sm relative"
-              >
-                INCOMING_REQUESTS()
-                <span className="absolute -top-1 -right-1 bg-[#39ff14] text-black text-xs px-2 py-0.5 rounded-full font-bold">
-                  {incomingRequests.length}
-                </span>
-              </button>
-            )}
+            <button
+              onClick={() => {
+                console.log('🔔 INCOMING_REQUESTS button clicked');
+                console.log('📊 Current incomingRequests state:', incomingRequests);
+                setShowRequestsModal(true);
+              }}
+              className="code-bg px-4 py-2 border-2 border-[#39ff14]/50 text-[#39ff14] hover:bg-[#39ff14]/10 transition-all pixel-text font-bold text-sm relative"
+            >
+              INCOMING_REQUESTS()
+              <span className={`absolute -top-1 -right-1 text-black text-xs px-2 py-0.5 rounded-full font-bold ${
+                incomingRequests.length > 0 ? 'bg-[#39ff14]' : 'bg-white/20 text-white/60'
+              }`}>
+                {incomingRequests.length}
+              </span>
+            </button>
             {team && (
               <div className="code-bg px-4 py-2 border-2 border-[#39ff14]/50">
                 <p className="text-white/80 text-sm font-bold pixel-text">
@@ -455,7 +633,6 @@ export default function MatchingPage() {
             <div className="code-bg p-6 border-2 border-[#39ff14]/50 sticky top-8">
               <div className="flex items-center justify-between mb-6">
                 <h2 className="text-xl font-bold text-white pixel-text code-glow">// FILTERS()</h2>
-                <span className="text-white/50 text-sm pixel-text">INTERFACE FILTEROPTIONS (</span>
               </div>
               
               {/* Role Filters */}
@@ -562,9 +739,6 @@ export default function MatchingPage() {
                   CLEAR_FILTERS()
                 </button>
               )}
-              <div className="mt-4 text-right text-xs text-white/50 pixel-text">
-                ) // FILTEROPTIONS
-              </div>
             </div>
           </div>
 
@@ -895,7 +1069,16 @@ export default function MatchingPage() {
             </h2>
             
             {incomingRequests.length === 0 ? (
-              <p className="text-white/60 pixel-text">No pending requests</p>
+              <div className="space-y-2">
+                <p className="text-white/60 pixel-text">No pending requests</p>
+                <p className="text-white/40 text-xs pixel-text">
+                  // DEBUG: Check console for request fetch logs
+                  <br />
+                  // User ID: {CURRENT_USER_ID}
+                  <br />
+                  // Looking for: toUserId or to_user_id = {CURRENT_USER_ID}
+                </p>
+              </div>
             ) : (
               <div className="space-y-4">
                 {incomingRequests.map((request) => {
@@ -963,6 +1146,22 @@ export default function MatchingPage() {
           onSelectTeam={handleSelectTeam}
           selectedTeamId={selectedTeam?._id}
           onClose={() => setShowGroupsPanel(false)}
+        />
+      )}
+
+      {/* Requests Panel */}
+      {showRequestsPanel && (
+        <RequestsPanel
+          incomingRequests={incomingRequests}
+          onAccept={handleAcceptRequest}
+          onDecline={handleDeclineRequest}
+          onClose={() => setShowRequestsPanel(false)}
+          hackathons={hackathons}
+          onViewProfile={(user) => {
+            setSelectedUser(user);
+            setShowProfileModal(true);
+            setShowRequestsPanel(false); // Close requests panel when viewing profile
+          }}
         />
       )}
 

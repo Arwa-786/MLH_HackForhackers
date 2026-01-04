@@ -107,6 +107,7 @@ const ChatPanel = ({ team, currentUserId, currentUserName, onClose }) => {
   const [teamName, setTeamName] = useState(team?.name || 'Team Chat');
   const [isEditingName, setIsEditingName] = useState(false);
   const [activeAgent, setActiveAgent] = useState(null); // ARCHITECT, SCRUM_MASTER, DESIGNER, or null
+  const [isAgentMenuOpen, setIsAgentMenuOpen] = useState(false); // Dropdown menu state
   const messagesEndRef = useRef(null);
   const messagesContainerRef = useRef(null);
   const [isUserAtBottom, setIsUserAtBottom] = useState(true);
@@ -234,10 +235,20 @@ const ChatPanel = ({ team, currentUserId, currentUserName, onClose }) => {
     setAiLoading(true);
     setShouldAutoScroll(true); // Force scroll when AI responds
     try {
-      await axios.post(`http://localhost:3000/chat/${team._id}/ai-advice`, {
+      const response = await axios.post(`http://localhost:3000/chat/${team._id}/ai-advice`, {
         prompt: newMessage.trim() || undefined,
         activeAgent: activeAgent // Include active agent in request
       });
+      
+      // Check if AI wants to create a repo automatically
+      if (response.data?.action === 'CREATE_REPO' || response.data?.actionType === 'GITHUB_INIT') {
+        const repoName = response.data?.repoName || response.data?.project_name;
+        // Automatically trigger GitHub initialization
+        setTimeout(() => {
+          initializeGitHub(repoName);
+        }, 500); // Small delay to let the message appear first
+      }
+      
       setNewMessage('');
       fetchTeamData(); // Refresh team data to show AI response
     } catch (error) {
@@ -292,11 +303,25 @@ const ChatPanel = ({ team, currentUserId, currentUserName, onClose }) => {
     }
   };
 
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (isAgentMenuOpen && !event.target.closest('.agent-menu-container')) {
+        setIsAgentMenuOpen(false);
+      }
+    };
+
+    if (isAgentMenuOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+      return () => document.removeEventListener('mousedown', handleClickOutside);
+    }
+  }, [isAgentMenuOpen]);
+
   return (
-    <div className="fixed left-80 top-0 right-0 bottom-0 bg-[#0a0a0a] z-40 flex flex-col border-l-2 border-[#39ff14]/50">
+    <div className="fixed left-80 top-0 right-0 bottom-0 bg-[#0a0a0a] z-50 flex flex-col border-l-2 border-[#39ff14]/50">
       <div className="w-full h-full bg-[#0a0a0a] flex flex-col code-bg">
         {/* Header */}
-        <div className="p-4 border-b-2 border-[#39ff14]/50 flex items-center justify-between">
+        <div className="p-4 border-b-2 border-[#39ff14]/50 flex items-center justify-between relative">
           <div className="flex-1">
             {isEditingName ? (
               <input
@@ -327,7 +352,8 @@ const ChatPanel = ({ team, currentUserId, currentUserName, onClose }) => {
           </div>
           <button
             onClick={onClose}
-            className="text-white/50 hover:text-[#39ff14] transition-colors text-xl font-bold pixel-text ml-4"
+            className="text-white/50 hover:text-[#39ff14] transition-colors text-xl font-bold pixel-text ml-4 z-50 relative"
+            style={{ minWidth: '32px', minHeight: '32px' }}
           >
             ×
           </button>
@@ -393,15 +419,29 @@ const ChatPanel = ({ team, currentUserId, currentUserName, onClose }) => {
                     )}
                   </div>
                   
-                  {/* GitHub Action Button */}
-                  {isAI && (msg.actionType === 'GITHUB_INIT' || msg.github_action) && (
+                  {/* GitHub Action Button - Show if action is CREATE_REPO or actionType is GITHUB_INIT */}
+                  {isAI && (msg.action === 'CREATE_REPO' || msg.actionType === 'GITHUB_INIT' || msg.github_action) && !teamData?.github_repo_url && (
                     <div className="mt-4 pt-3 border-t border-green-400/30">
                       <button
-                        onClick={() => initializeGitHub(msg.project_name)}
+                        onClick={() => initializeGitHub(msg.repoName || msg.project_name)}
                         disabled={loading}
                         className="w-full px-4 py-2 bg-black/50 border-2 border-green-400 text-green-400 hover:bg-green-400/10 hover:border-green-300 transition-all duration-200 pixel-text text-xs font-bold relative overflow-hidden group disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <span className="relative z-10">EXECUTE_GIT_SCAFFOLD()</span>
+                        <div className="absolute inset-0 bg-green-400/5 opacity-0 group-hover:opacity-100 transition-opacity duration-200"></div>
+                        <div className="absolute inset-0 bg-gradient-to-r from-transparent via-green-400/10 to-transparent translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000"></div>
+                      </button>
+                    </div>
+                  )}
+                  
+                  {/* Open Workspace Button - Show if repo is already created */}
+                  {isAI && teamData?.replit_url && (
+                    <div className="mt-4 pt-3 border-t border-green-400/30">
+                      <button
+                        onClick={() => launchReplit(teamData.replit_url)}
+                        className="w-full px-4 py-2 bg-black/50 border-2 border-green-400 text-green-400 hover:bg-green-400/10 hover:border-green-300 transition-all duration-200 pixel-text text-xs font-bold relative overflow-hidden group"
+                      >
+                        <span className="relative z-10">OPEN_WORKSPACE()</span>
                         <div className="absolute inset-0 bg-green-400/5 opacity-0 group-hover:opacity-100 transition-opacity duration-200"></div>
                         <div className="absolute inset-0 bg-gradient-to-r from-transparent via-green-400/10 to-transparent translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000"></div>
                       </button>
@@ -420,52 +460,89 @@ const ChatPanel = ({ team, currentUserId, currentUserName, onClose }) => {
       </div>
 
       {/* Input Area */}
-      <div className="p-6 border-t-2 border-[#39ff14]/50 bg-black/50">
-        {/* Agent Switcher */}
-        <div className="flex gap-2 mb-3">
+      <div className="p-6 border-t-2 border-[#39ff14]/50 bg-black/50 relative">
+        {/* Active Agent Display */}
+        {activeAgent && (
+          <div className="mb-2 text-xs text-[#39ff14] pixel-text font-bold">
+            {'>'} AGENT: {activeAgent}
+          </div>
+        )}
+        
+        {/* Agent Dropdown Menu */}
+        <div className="relative mb-3 agent-menu-container">
           <button
-            onClick={() => setActiveAgent(activeAgent === 'ARCHITECT' ? null : 'ARCHITECT')}
-            className={`px-3 py-1.5 text-xs border-2 font-bold transition-all duration-200 pixel-text ${
-              activeAgent === 'ARCHITECT'
-                ? 'bg-[#39ff14]/20 border-[#39ff14] text-[#39ff14]'
-                : 'bg-black/50 border-[#39ff14]/30 text-[#39ff14]/70 hover:border-[#39ff14]/50'
-            }`}
+            onClick={() => setIsAgentMenuOpen(!isAgentMenuOpen)}
+            className="px-3 py-2 bg-black/50 border-2 border-[#39ff14]/50 text-[#39ff14] hover:bg-[#39ff14]/10 hover:border-[#39ff14] transition-all duration-200 pixel-text text-sm font-bold flex items-center gap-2"
           >
-            [ARCHITECT]
+            <span>👤</span>
+            <span>AGENT</span>
           </button>
-          <button
-            onClick={() => setActiveAgent(activeAgent === 'SCRUM_MASTER' ? null : 'SCRUM_MASTER')}
-            className={`px-3 py-1.5 text-xs border-2 font-bold transition-all duration-200 pixel-text ${
-              activeAgent === 'SCRUM_MASTER'
-                ? 'bg-[#39ff14]/20 border-[#39ff14] text-[#39ff14]'
-                : 'bg-black/50 border-[#39ff14]/30 text-[#39ff14]/70 hover:border-[#39ff14]/50'
+          
+          {/* Sliding Dropdown Menu - Opens above the input */}
+          <div
+            className={`absolute bottom-full left-0 mb-2 bg-black/90 backdrop-blur-sm border-2 border-[#39ff14]/50 shadow-[0_0_20px_rgba(57,255,20,0.3)] z-50 transition-all duration-300 overflow-hidden ${
+              isAgentMenuOpen
+                ? 'opacity-100 max-h-96 translate-y-0'
+                : 'opacity-0 max-h-0 translate-y-2 pointer-events-none'
             }`}
+            style={{ minWidth: '200px' }}
           >
-            [SCRUM_MASTER]
-          </button>
-          <button
-            onClick={() => setActiveAgent(activeAgent === 'DESIGNER' ? null : 'DESIGNER')}
-            className={`px-3 py-1.5 text-xs border-2 font-bold transition-all duration-200 pixel-text ${
-              activeAgent === 'DESIGNER'
-                ? 'bg-[#39ff14]/20 border-[#39ff14] text-[#39ff14]'
-                : 'bg-black/50 border-[#39ff14]/30 text-[#39ff14]/70 hover:border-[#39ff14]/50'
-            }`}
-          >
-            [DESIGNER]
-          </button>
-          {activeAgent && (
-            <div className="flex-1 text-xs text-[#39ff14]/70 pixel-text flex items-center ml-2">
-              // Active: {activeAgent}
+            <div className="p-2 space-y-1">
+              <button
+                onClick={() => {
+                  setActiveAgent(activeAgent === 'ARCHITECT' ? null : 'ARCHITECT');
+                  setIsAgentMenuOpen(false);
+                }}
+                className={`w-full px-4 py-2 text-left text-xs border-2 font-bold transition-all duration-200 pixel-text ${
+                  activeAgent === 'ARCHITECT'
+                    ? 'bg-[#39ff14]/20 border-[#39ff14] text-[#39ff14] shadow-[0_0_10px_rgba(57,255,20,0.5)]'
+                    : 'bg-black/50 border-[#39ff14]/30 text-[#39ff14]/70 hover:bg-[#39ff14]/10 hover:border-[#39ff14]/50'
+                }`}
+              >
+                [ARCHITECT]
+              </button>
+              <button
+                onClick={() => {
+                  setActiveAgent(activeAgent === 'SCRUM_MASTER' ? null : 'SCRUM_MASTER');
+                  setIsAgentMenuOpen(false);
+                }}
+                className={`w-full px-4 py-2 text-left text-xs border-2 font-bold transition-all duration-200 pixel-text ${
+                  activeAgent === 'SCRUM_MASTER'
+                    ? 'bg-[#39ff14]/20 border-[#39ff14] text-[#39ff14] shadow-[0_0_10px_rgba(57,255,20,0.5)]'
+                    : 'bg-black/50 border-[#39ff14]/30 text-[#39ff14]/70 hover:bg-[#39ff14]/10 hover:border-[#39ff14]/50'
+                }`}
+              >
+                [SCRUM_MASTER]
+              </button>
+              <button
+                onClick={() => {
+                  setActiveAgent(activeAgent === 'DESIGNER' ? null : 'DESIGNER');
+                  setIsAgentMenuOpen(false);
+                }}
+                className={`w-full px-4 py-2 text-left text-xs border-2 font-bold transition-all duration-200 pixel-text ${
+                  activeAgent === 'DESIGNER'
+                    ? 'bg-[#39ff14]/20 border-[#39ff14] text-[#39ff14] shadow-[0_0_10px_rgba(57,255,20,0.5)]'
+                    : 'bg-black/50 border-[#39ff14]/30 text-[#39ff14]/70 hover:bg-[#39ff14]/10 hover:border-[#39ff14]/50'
+                }`}
+              >
+                [DESIGNER]
+              </button>
             </div>
-          )}
+          </div>
         </div>
+        
         <div className="flex gap-3 mb-3">
           <button
             onClick={askAI}
             disabled={aiLoading}
             className="px-4 py-2 bg-[#39ff14]/50 text-[#39ff14] border-2 border-[#39ff14]/50 font-bold transition-all duration-200 hover:bg-[#39ff14]/30 hover:border-[#39ff14] disabled:opacity-50 disabled:cursor-not-allowed pixel-text text-sm"
           >
-            {aiLoading ? '// AI_THINKING...' : 'ASK_AI_MENTOR()'}
+            {aiLoading 
+              ? '// AI_THINKING...' 
+              : activeAgent 
+                ? `CONSULT_${activeAgent}()` 
+                : 'ASK_AI_MENTOR()'
+            }
           </button>
           <div className="flex-1 text-xs text-[#39ff14]/70 pixel-text flex items-center">
             // Type your message or ask AI for project ideas, execution plans, and team advice

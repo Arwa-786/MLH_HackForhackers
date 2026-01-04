@@ -177,6 +177,9 @@ export default function LandingPage() {
           <div className="text-left mb-4 text-[#39ff14] text-sm pixel-text">
             // INIT_PROFILE()
           </div>
+          <div className="text-4xl font-bold mb-4 text-[#39ff14] pixel-text code-glow">
+            HackConnect
+          </div>
           <h1 className="text-6xl font-bold mb-6 text-white pixel-text code-glow">
             FIND YOUR
             <br />

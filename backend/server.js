@@ -22,6 +22,141 @@ if (process.env.GITHUB_TOKEN) {
   console.log('⚠️ GITHUB_TOKEN not set - GitHub features disabled');
 }
 
+// Note: genAI is initialized later in the file (around line 280)
+
+// Tool: Create GitHub Repository
+// This function will be registered with Gemini as a callable tool
+async function createGitHubRepo(teamId, repoName, description = null) {
+  try {
+    if (!octokit) {
+      throw new Error('GitHub integration not configured. GITHUB_TOKEN not set in .env');
+    }
+    
+    if (!teamId) {
+      throw new Error('teamId is required');
+    }
+    
+    // Get team info
+    let team;
+    try {
+      if (mongoose.Types.ObjectId.isValid(teamId)) {
+        team = await Team.findById(teamId);
+      }
+    } catch (idError) {
+      console.log(`⚠️ ObjectId lookup failed:`, idError.message);
+    }
+    
+    if (!team) {
+      team = await Team.findOne({ _id: teamId.toString() });
+    }
+    
+    if (!team) {
+      throw new Error('Team not found');
+    }
+    
+    // Get team members with GitHub usernames
+    const members = await User.find({ _id: { $in: team.members.map(id => id.toString()) } });
+    const githubUsernames = members
+      .map(m => m.github)
+      .filter(github => github && github.trim())
+      .map(github => github.replace(/^https?:\/\/(www\.)?github\.com\//, '').replace(/\/$/, '').trim());
+    
+    if (githubUsernames.length === 0) {
+      throw new Error('No team members have GitHub usernames configured in their profiles');
+    }
+    
+    // Generate repository name
+    const finalRepoName = repoName 
+      ? repoName.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').substring(0, 100)
+      : `hackathon-${team.name?.toLowerCase().replace(/[^a-z0-9-]/g, '-') || 'project'}-${Date.now()}`;
+    
+    // Get the authenticated user (token owner) to create the repo
+    const { data: authUser } = await octokit.users.getAuthenticated();
+    const repoOwner = authUser.login;
+    
+    console.log(`📦 Creating repository: ${repoOwner}/${finalRepoName}`);
+    
+    // Create repository
+    const repo = await octokit.repos.createForAuthenticatedUser({
+      name: finalRepoName,
+      description: description || `Hackathon project: ${team.name || 'Team Project'}`,
+      private: false,
+      auto_init: true // Initialize with README
+    });
+    
+    console.log(`✅ Repository created: ${repo.data.full_name}`);
+    
+    const repoFullName = repo.data.full_name;
+    const [owner, name] = repoFullName.split('/');
+    
+    // Invite team members to the repository
+    const inviteResults = [];
+    for (const username of githubUsernames) {
+      // Skip if it's the repo owner
+      if (username === repoOwner) {
+        inviteResults.push({ username, status: 'owner' });
+        continue;
+      }
+      
+      try {
+        await octokit.repos.addCollaborator({
+          owner,
+          repo: name,
+          username,
+          permission: 'push'
+        });
+        inviteResults.push({ username, status: 'invited' });
+        console.log(`✅ Invited ${username} to repository`);
+      } catch (inviteError) {
+        console.log(`⚠️ Could not invite ${username}:`, inviteError.message);
+        inviteResults.push({ username, status: 'failed', error: inviteError.message });
+      }
+    }
+    
+    // Generate Replit import URL
+    const replitUrl = `https://replit.com/github/${owner}/${name}`;
+    
+    // Update team with repository info
+    await Team.findByIdAndUpdate(
+      team._id,
+      { 
+        $set: { 
+          github_repo: repoFullName,
+          github_repo_url: repo.data.html_url,
+          replit_url: replitUrl
+        } 
+      }
+    );
+    
+    // Post a new message in the chat with the GitHub link
+    const githubMessage = {
+      senderId: 'ai_bot',
+      text: `✅ GitHub repository created successfully!\n\n🔗 Repository: ${repoFullName}\n📦 URL: ${repo.data.html_url}\n\nYou can now start pushing code to your repository. The Replit import URL is: ${replitUrl}`,
+      timestamp: new Date()
+    };
+    
+    await Team.findByIdAndUpdate(
+      team._id,
+      { $push: { messages: githubMessage } },
+      { new: true }
+    );
+    
+    return {
+      success: true,
+      repository: {
+        name: repoFullName,
+        url: repo.data.html_url,
+        clone_url: repo.data.clone_url
+      },
+      replit_url: replitUrl,
+      invites: inviteResults
+    };
+  } catch (error) {
+    console.error('❌ Error in createGitHubRepo tool:', error);
+    throw error;
+  }
+}
+
 // Middleware
 app.use(cors({
   origin: '*', // Allow all origins (or specify your frontend URL)
@@ -77,12 +212,15 @@ const User = mongoose.model('User', UserSchema);
 // Request Schema
 const RequestSchema = new mongoose.Schema({
   from_user_id: String,
+  fromUserId: String, // Support camelCase
   to_user_id: String,
+  toUserId: String, // Support camelCase
   hackathon_id: String,
+  hackathonId: String, // Support camelCase
   status: { type: String, default: 'pending' },
   message: String,
   createdAt: { type: Date, default: Date.now }
-});
+}, { strict: false }); // Allow fields not in schema (for flexibility)
 
 const Request = mongoose.model('Request', RequestSchema);
 
@@ -115,9 +253,11 @@ const TeamSchema = new mongoose.Schema({
     senderId: String,
     text: String,
     timestamp: { type: Date, default: Date.now },
+    action: String, // Action type (e.g., 'CREATE_REPO')
     actionType: String, // Action type (e.g., 'GITHUB_INIT')
     github_action: { type: Boolean, default: false }, // Flag for GitHub action buttons (backward compatibility)
-    project_name: String // Project name for GitHub repo
+    project_name: String, // Project name for GitHub repo
+    repoName: String // Repository name for CREATE_REPO action
   }],
   github_repo: String, // Full repo name (owner/repo)
   github_repo_url: String, // GitHub repository URL
@@ -498,7 +638,13 @@ app.get('/hackathons', async (req, res) => {
         imageUrl: hackathon.imageUrl || null, // Include imageUrl field from MongoDB
         description: hackathon.description || '',
         type: hackathon.type || ''
+        // Explicitly exclude 'day' field if it exists in MongoDB
       };
+      
+      // Remove 'day' field if it exists (to prevent "(day: X)" from appearing)
+      if (result.day) {
+        delete result.day;
+      }
       
       // Debug: Log if imageUrl exists
       if (hackathon.imageUrl) {
@@ -641,6 +787,37 @@ app.get('/api/users', async (req, res) => {
   } catch (error) {
     console.error('Error fetching users:', error);
     res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+// GET /api/users/:userId - Get a single user by ID
+app.get('/api/users/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    console.log(`📥 GET /api/users/:userId - userId: ${userId}`);
+    
+    // Use EXACT same approach as incoming requests route (lines 1580-1600) that successfully finds users
+    const userIdStr = String(userId);
+    let user = await User.findOne({ _id: userIdStr });
+    
+    if (!user) {
+      user = await User.findById(userIdStr);
+    }
+    
+    if (!user) {
+      user = await User.findOne({ _id: userId });
+    }
+    
+    if (!user) {
+      console.log(`❌ User not found: ${userIdStr}`);
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    console.log(`✅ User found: ${user.name} (${user._id})`);
+    res.json(user);
+  } catch (error) {
+    console.error('❌ Error fetching user:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -924,18 +1101,52 @@ app.post('/match-score', async (req, res) => {
     // 1. Resolve Users: Handle both Direct Objects (from Prompt) and IDs (from Frontend)
     // Since _id is stored as String in the database, search directly as string
     const findUser = async (id) => {
-      if (!id) return null;
+      if (!id) {
+        console.log(`   ⚠️ No ID provided to findUser`);
+        return null;
+      }
       
       // Convert to string and search directly (no ObjectId conversion needed)
-      const stringId = id.toString();
-      console.log(`   🔍 Searching for ID as string: ${stringId}`);
+      const stringId = String(id).trim();
+      console.log(`   🔍 Searching for ID as string: "${stringId}" (original type: ${typeof id}, original value: ${id})`);
       
       // Use findOne with string _id (since schema defines _id as String)
       let user = await User.findOne({ _id: stringId }).lean();
       
       // If not found, try findById as fallback (Mongoose may still handle it)
       if (!user) {
+        console.log(`   🔄 Trying findById with string...`);
         user = await User.findById(stringId).lean();
+      }
+      
+      // If still not found, try without .lean() to get Mongoose document
+      if (!user) {
+        console.log(`   🔄 Trying without .lean()...`);
+        user = await User.findOne({ _id: stringId });
+        if (user) {
+          user = user.toObject();
+        }
+      }
+      
+      // If still not found, try exact match without any conversion
+      if (!user) {
+        console.log(`   🔄 Trying exact match...`);
+        user = await User.findOne({ _id: id }).lean();
+      }
+      
+      if (!user) {
+        console.log(`   ⚠️ User not found with ID: ${stringId}`);
+        // Debug: show what IDs exist in database
+        const sampleUsers = await User.find({}).limit(5).select('_id name').lean();
+        console.log(`   🔍 Sample user IDs in DB:`, sampleUsers.map(u => ({ 
+          id: String(u._id), 
+          idType: typeof u._id,
+          idConstructor: u._id?.constructor?.name,
+          name: u.name 
+        })));
+        console.log(`   🔍 Comparing: Looking for "${stringId}" vs DB has "${sampleUsers[0]?._id}" (match: ${String(sampleUsers[0]?._id) === stringId})`);
+      } else {
+        console.log(`   ✅ User found: ${user.name} (${user._id})`);
       }
       
       return user;
@@ -945,32 +1156,12 @@ app.post('/match-score', async (req, res) => {
       console.log(`🔍 Looking up user1_id: ${user1_id} (type: ${typeof user1_id})`);
       currentUser = await findUser(user1_id);
       console.log(`✅ User1 found: ${currentUser ? currentUser.name : 'NOT FOUND'}`);
-      
-      if (!currentUser) {
-        // Debug: show what IDs exist in database
-        const sampleUsers = await User.find({}).limit(3).select('_id name').lean();
-        console.log(`   Sample user IDs in DB:`, sampleUsers.map(u => ({ 
-          id: u._id.toString(), 
-          idType: u._id.constructor.name,
-          name: u.name 
-        })));
-      }
     }
     
     if (!targetUser && user2_id) {
       console.log(`🔍 Looking up user2_id: ${user2_id} (type: ${typeof user2_id})`);
       targetUser = await findUser(user2_id);
       console.log(`✅ User2 found: ${targetUser ? targetUser.name : 'NOT FOUND'}`);
-      
-      if (!targetUser) {
-        // Debug: show what IDs exist in database
-        const sampleUsers = await User.find({}).limit(3).select('_id name').lean();
-        console.log(`   Sample user IDs in DB:`, sampleUsers.map(u => ({ 
-          id: u._id.toString(), 
-          idType: u._id.constructor.name,
-          name: u.name 
-        })));
-      }
     }
 
     // Validation
@@ -1005,12 +1196,28 @@ app.post('/match-score', async (req, res) => {
 // POST request to send team request
 app.post('/request', async (req, res) => {
   try {
-    const { from_user_id, to_user_id, message, hackathon_id } = req.body;
+    // Support both camelCase and snake_case from frontend
+    const from_user_id = req.body.from_user_id || req.body.fromUserId;
+    const to_user_id = req.body.to_user_id || req.body.toUserId;
+    const hackathon_id = req.body.hackathon_id || req.body.hackathonId;
+    const message = req.body.message || '';
+
+    if (!from_user_id || !to_user_id) {
+      return res.status(400).json({ error: 'from_user_id and to_user_id are required' });
+    }
+
+    // Validate that IDs are not placeholder values
+    if (from_user_id.includes('placeholder') || to_user_id.includes('placeholder')) {
+      return res.status(400).json({ error: 'Invalid user ID: placeholder values are not allowed' });
+    }
 
     // Check if user already sent 5 requests for this hackathon
+    // Support both field name formats
     const requestCount = await Request.countDocuments({
-      from_user_id,
-      hackathon_id: hackathon_id || null,
+      $or: [
+        { from_user_id, hackathon_id: hackathon_id || null },
+        { fromUserId: from_user_id, hackathonId: hackathon_id || null }
+      ],
       status: 'pending'
     });
 
@@ -1018,11 +1225,15 @@ app.post('/request', async (req, res) => {
       return res.status(400).json({ error: 'Maximum 5 requests allowed' });
     }
 
+    // Create request with both snake_case and camelCase for compatibility
     const newRequest = await Request.create({
       from_user_id,
+      fromUserId: from_user_id, // Also set camelCase
       to_user_id,
+      toUserId: to_user_id, // Also set camelCase
       hackathon_id: hackathon_id || null,
-      message: message || '',
+      hackathonId: hackathon_id || null, // Also set camelCase
+      message: message,
       status: 'pending'
     });
 
@@ -1254,25 +1465,39 @@ app.post('/team', async (req, res) => {
 // POST /api/request - Create a team request
 app.post('/api/request', async (req, res) => {
   try {
-    const { from_user_id, to_user_id } = req.body;
+    // Support both camelCase and snake_case from frontend
+    const from_user_id = req.body.from_user_id || req.body.fromUserId;
+    const to_user_id = req.body.to_user_id || req.body.toUserId;
+    const hackathon_id = req.body.hackathon_id || req.body.hackathonId;
+    const message = req.body.message || '';
     
     if (!from_user_id || !to_user_id) {
       return res.status(400).json({ error: 'from_user_id and to_user_id are required' });
     }
+
+    // Validate that IDs are not placeholder values
+    if (from_user_id.includes('placeholder') || to_user_id.includes('placeholder')) {
+      return res.status(400).json({ error: 'Invalid user ID: placeholder values are not allowed' });
+    }
     
-    // Check if request already exists
+    // Check if request already exists (support both formats)
     const existingRequest = await Request.findOne({
-      from_user_id,
-      to_user_id
+      $or: [
+        { from_user_id, to_user_id },
+        { fromUserId: from_user_id, toUserId: to_user_id }
+      ]
     });
     
     if (existingRequest) {
       return res.status(400).json({ error: 'Request already sent' });
     }
     
-    // Check request limit (5 per user)
+    // Check request limit (5 per user per hackathon) - support both formats
     const requestCount = await Request.countDocuments({
-      from_user_id,
+      $or: [
+        { from_user_id, hackathon_id: hackathon_id || null },
+        { fromUserId: from_user_id, hackathonId: hackathon_id || null }
+      ],
       status: 'pending'
     });
     
@@ -1280,10 +1505,15 @@ app.post('/api/request', async (req, res) => {
       return res.status(400).json({ error: 'Maximum of 5 pending requests allowed' });
     }
     
-    // Create new request
+    // Create new request with both formats for compatibility
     const newRequest = new Request({
       from_user_id,
+      fromUserId: from_user_id, // Also set camelCase
       to_user_id,
+      toUserId: to_user_id, // Also set camelCase
+      hackathon_id: hackathon_id || null,
+      hackathonId: hackathon_id || null, // Also set camelCase
+      message: message,
       status: 'pending'
     });
     
@@ -1325,17 +1555,109 @@ app.get('/api/requests/incoming/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
     
+    console.log(`📥 GET /api/requests/incoming/:userId - userId: ${userId}`);
+    console.log(`📥 userId type: ${typeof userId}, value: ${userId}`);
+    
+    // Support both snake_case and camelCase field names
+    // Also try both string and ObjectId comparisons
+    // Use .lean() to get raw MongoDB documents (not Mongoose documents)
     const incomingRequests = await Request.find({
-      to_user_id: userId,
-      status: 'pending'
-    });
+      $and: [
+        {
+          $or: [
+            { to_user_id: userId },
+            { toUserId: userId },
+            { to_user_id: userId.toString() },
+            { toUserId: userId.toString() }
+          ]
+        },
+        { status: 'pending' }
+      ]
+    }).lean();
+    
+    console.log(`✅ Found ${incomingRequests.length} incoming requests`);
+    if (incomingRequests.length > 0) {
+      console.log(`📋 Request details:`, incomingRequests.map(r => ({
+        _id: r._id,
+        fromUserId: r.from_user_id || r.fromUserId,
+        toUserId: r.to_user_id || r.toUserId,
+        status: r.status
+      })));
+    } else {
+      // Debug: Check what requests exist
+      const allRequests = await Request.find({});
+      console.log(`🔍 Total requests in DB: ${allRequests.length}`);
+      if (allRequests.length > 0) {
+        console.log(`📋 Sample request:`, {
+          _id: allRequests[0]._id,
+          fromUserId: allRequests[0].from_user_id || allRequests[0].fromUserId,
+          toUserId: allRequests[0].to_user_id || allRequests[0].toUserId,
+          status: allRequests[0].status
+        });
+      }
+    }
     
     // Fetch user data for each request
     const requestsWithUsers = await Promise.all(
       incomingRequests.map(async (request) => {
-        const user = await User.findById(request.from_user_id);
+        // Support both camelCase and snake_case field names
+        // request is a plain object from .lean(), so access fields directly
+        // Check camelCase FIRST since that's what's in MongoDB
+        const fromUserId = request.fromUserId || request.from_user_id;
+        console.log(`  📋 Request from user: ${fromUserId} (type: ${typeof fromUserId})`);
+        console.log(`  📋 Request.fromUserId: ${request.fromUserId}`);
+        console.log(`  📋 Request.from_user_id: ${request.from_user_id}`);
+        console.log(`  📋 Request object keys:`, Object.keys(request));
+        
+        if (!fromUserId) {
+          console.log(`  ⚠️ No fromUserId found in request!`);
+          console.log(`  📋 Full request object:`, JSON.stringify(request, null, 2));
+          return {
+            ...request,
+            _id: request._id?.toString ? request._id.toString() : String(request._id),
+            from_user_id: {
+              _id: 'unknown',
+              name: 'Unknown User',
+              skills: [],
+              tech_stack: []
+            }
+          };
+        }
+        
+        let user = null;
+        try {
+          // Since User schema has _id as String, use findOne with string
+          const userIdStr = String(fromUserId);
+          console.log(`  🔍 Looking up user with ID: ${userIdStr}`);
+          
+          user = await User.findOne({ _id: userIdStr });
+          
+          if (!user) {
+            // Try findById (Mongoose might handle string conversion)
+            user = await User.findById(userIdStr);
+          }
+          
+          if (!user) {
+            // Try without String conversion
+            user = await User.findOne({ _id: fromUserId });
+          }
+          
+          console.log(`  ${user ? '✅' : '❌'} User lookup: ${user ? `${user.name} (${user._id})` : 'NOT FOUND'} for ID: ${fromUserId}`);
+          
+          if (!user) {
+            // Debug: Check what users exist
+            const sampleUsers = await User.find({}).limit(3);
+            console.log(`  🔍 Sample user IDs in DB:`, sampleUsers.map(u => ({ _id: String(u._id), name: u.name })));
+          }
+        } catch (userError) {
+          console.log(`  ⚠️ Error finding user ${fromUserId}:`, userError.message);
+          console.log(`  ⚠️ Error stack:`, userError.stack);
+        }
+        
+        // request is already a plain object from .lean(), no need for toObject()
         return {
-          ...request.toObject(),
+          ...request,
+          _id: request._id?.toString ? request._id.toString() : String(request._id), // Ensure _id is a string
           from_user_id: user ? {
             _id: user._id,
             name: user.name,
@@ -1343,13 +1665,25 @@ app.get('/api/requests/incoming/:userId', async (req, res) => {
             skills: user.skills,
             tech_stack: user.tech_stack,
             github: user.github,
+            devpost: user.devpost,
             school: user.school,
-            location: user.location
-          } : null
+            location: user.location,
+            bio: user.bio,
+            experience: user.experience,
+            num_hackathons: user.num_hackathons,
+            role_preference: user.role_preference,
+            description: user.description
+          } : {
+            _id: fromUserId,
+            name: 'Unknown User',
+            skills: [],
+            tech_stack: []
+          }
         };
       })
     );
     
+    console.log(`✅ Returning ${requestsWithUsers.length} requests with user data`);
     res.json(requestsWithUsers);
   } catch (error) {
     console.error('Error fetching incoming requests:', error);
@@ -1367,8 +1701,20 @@ app.post('/requests/:requestId/accept', async (req, res) => {
       return res.status(400).json({ error: 'current_user_id is required' });
     }
     
-    // Find the request
-    const request = await Request.findById(requestId);
+    // Find the request - support both ObjectId and string
+    let request;
+    try {
+      if (mongoose.Types.ObjectId.isValid(requestId)) {
+        request = await Request.findById(requestId);
+      }
+    } catch (idError) {
+      console.log(`⚠️ ObjectId lookup failed:`, idError.message);
+    }
+    
+    if (!request) {
+      request = await Request.findOne({ _id: requestId.toString() });
+    }
+    
     if (!request) {
       return res.status(404).json({ error: 'Request not found' });
     }
@@ -1377,45 +1723,65 @@ app.post('/requests/:requestId/accept', async (req, res) => {
       return res.status(400).json({ error: 'Request is not pending' });
     }
     
-    // Verify the current user is the recipient
-    if (request.to_user_id !== current_user_id) {
+    // Verify the current user is the recipient - support both field name formats
+    const toUserId = request.to_user_id || request.toUserId;
+    if (toUserId !== current_user_id) {
       return res.status(403).json({ error: 'You can only accept requests sent to you' });
     }
     
-    const senderId = request.from_user_id;
-    const hackathonId = request.hackathon_id;
+    const senderId = request.from_user_id || request.fromUserId;
+    const hackathonId = request.hackathon_id || request.hackathonId; // Support both formats
     
-    // Check if sender already has a team for this hackathon
+    // Check if current user already has a team for this hackathon
     let team = await Team.findOne({
       $or: [
         { hackathon_id: hackathonId },
         { hackathonId: hackathonId } // Support camelCase for manually created teams
       ],
-      members: senderId.toString()
+      members: current_user_id.toString()
     });
     
     if (team) {
-      // Add current user to existing team
-      if (!team.members.includes(current_user_id.toString())) {
-        team.members.push(current_user_id.toString());
+      // Add sender to existing team (if not already a member)
+      if (!team.members.includes(senderId.toString())) {
+        team.members.push(senderId.toString());
         await team.save();
       }
     } else {
-      // Create new team with both users
-      const teamCount = await Team.countDocuments({ 
+      // Check if sender has a team we should join
+      let senderTeam = await Team.findOne({
         $or: [
           { hackathon_id: hackathonId },
           { hackathonId: hackathonId }
-        ]
+        ],
+        members: senderId.toString()
       });
-      const teamName = `Team ${teamCount + 1}`;
       
-      team = await Team.create({
-        hackathon_id: hackathonId,
-        name: teamName,
-        members: [senderId.toString(), current_user_id.toString()],
-        is_full: false
-      });
+      if (senderTeam) {
+        // Join sender's existing team
+        if (!senderTeam.members.includes(current_user_id.toString())) {
+          senderTeam.members.push(current_user_id.toString());
+          await senderTeam.save();
+        }
+        team = senderTeam;
+      } else {
+        // Create new team with both users
+        const teamCount = await Team.countDocuments({ 
+          $or: [
+            { hackathon_id: hackathonId },
+            { hackathonId: hackathonId }
+          ]
+        });
+        const teamName = `Team ${teamCount + 1}`;
+        
+        team = await Team.create({
+          hackathon_id: hackathonId,
+          hackathonId: hackathonId, // Also set camelCase for consistency
+          name: teamName,
+          members: [senderId.toString(), current_user_id.toString()],
+          is_full: false
+        });
+      }
     }
     
     // Mark request as accepted
@@ -1423,19 +1789,54 @@ app.post('/requests/:requestId/accept', async (req, res) => {
     await request.save();
     
     // Reject all other pending requests from the same sender for this hackathon
+    // Support both field name formats
     await Request.updateMany(
       {
-        from_user_id: senderId,
-        hackathon_id: hackathonId,
-        status: 'pending',
-        _id: { $ne: requestId }
+        $and: [
+          {
+            $or: [
+              { from_user_id: senderId },
+              { fromUserId: senderId }
+            ]
+          },
+          {
+            $or: [
+              { hackathon_id: hackathonId },
+              { hackathonId: hackathonId }
+            ]
+          },
+          { status: 'pending' },
+          { _id: { $ne: requestId } }
+        ]
       },
       { status: 'rejected' }
     );
     
+    // Get all team member names for welcome message
+    const teamMembers = await User.find({ 
+      _id: { $in: team.members.map(id => id.toString()) } 
+    });
+    const memberNames = teamMembers.map(m => m.name || 'Member').join(', ');
+    
+    // Post welcome message from system_bot
+    const welcomeMessage = {
+      senderId: 'system_bot',
+      text: `🎉 Team formed! ${memberNames} are now collaborating. Let's build something amazing together!`,
+      timestamp: new Date()
+    };
+    
+    await Team.findByIdAndUpdate(
+      team._id,
+      { $push: { messages: welcomeMessage } },
+      { new: true }
+    );
+    
+    // Refresh team to include the welcome message
+    const updatedTeam = await Team.findById(team._id);
+    
     res.json({
       success: true,
-      team: team,
+      team: updatedTeam,
       message: 'Request accepted and team created/updated'
     });
   } catch (error) {
@@ -1730,18 +2131,16 @@ app.post('/chat/:teamId/ai-advice', async (req, res) => {
       return `${sender}: ${msg.text}`;
     }).join('\n');
     
-    // Determine system prompt based on activeAgent
-    let systemPrompt = '';
-    switch (activeAgent) {
-      case 'ARCHITECT':
-        systemPrompt = `You are a Technical Architect AI mentor specializing in GitHub repository structure, tech stack decisions, and code organization.
+    // Specialists object with different System Instructions for each agent
+    const specialists = {
+      ARCHITECT: `You are a Technical Architect specialist focused on tech stack decisions, GitHub repository structure, and file scaffolding.
 
-Your expertise includes:
-- Recommending optimal project structure and folder organization
-- Suggesting appropriate tech stacks based on team skills
-- Creating GitHub repository scaffolding with proper README, .gitignore, and initial file structure
-- Advising on architecture patterns, API design, and database schemas
-- Setting up development environments and build configurations
+Your core expertise:
+- Tech stack selection (React, Node.js, Python, etc.) based on project requirements
+- GitHub repository structure and organization (folders, files, naming conventions)
+- File scaffolding and project setup (package.json, config files, .gitignore)
+- Architecture patterns and best practices
+- Development environment configuration
 
 TEAM MEMBERS:
 ${memberSkills}
@@ -1750,24 +2149,27 @@ HACKATHON: ${hackathonName}
 
 ${recentMessages ? `RECENT CONVERSATION:\n${recentMessages}\n\n` : ''}
 
-Focus on providing technical architecture guidance. When the team is ready to start coding, recommend a specific project structure and include a JSON object at the end with:
-{
-  "actionType": "GITHUB_INIT",
-  "project_name": "<suggested project name>",
-  "ready_to_code": true
-}`;
-        break;
-        
-      case 'SCRUM_MASTER':
-        systemPrompt = `You are a Scrum Master AI mentor specializing in Replit collaboration, task timing, sprint planning, and team coordination.
+CRITICAL: You are a DevOps Agent with tool access. You can CREATE repositories, not just talk about them.
 
-Your expertise includes:
+If the user asks for a 'repo', 'repository', 'workspace', or wants to 'start coding':
+- DO NOT give instructions or explanations
+- DO NOT return JSON objects
+- IMMEDIATELY call the createGitHubRepo tool with an appropriate repoName
+- After the tool executes, respond with: "Repo created! [Link]. You can now launch it in Replit using the [OPEN_WORKSPACE] button."
+
+The repoName should be lowercase, use hyphens, and be descriptive (e.g., "hackathon-vr-app" or "team-collaboration-tool").
+
+Otherwise, provide technical architecture guidance focused on tech stack, repo structure, and file scaffolding.`,
+
+      SCRUM_MASTER: `You are a Scrum Master specialist focused on Replit collaboration, timing, and task breaking.
+
+Your core expertise:
 - Breaking down projects into manageable tasks and sprints
-- Estimating time for each task (ideal for 24-hour hackathons)
-- Coordinating team member responsibilities
-- Setting up Replit collaboration workflows
-- Managing deadlines and ensuring team stays on track
-- Facilitating stand-ups and progress check-ins
+- Time estimation for 24-hour hackathons
+- Replit collaboration workflows and team coordination
+- Task assignment and responsibility distribution
+- Progress tracking and deadline management
+- Stand-up facilitation and team communication
 
 TEAM MEMBERS:
 ${memberSkills}
@@ -1776,19 +2178,27 @@ HACKATHON: ${hackathonName}
 
 ${recentMessages ? `RECENT CONVERSATION:\n${recentMessages}\n\n` : ''}
 
-Focus on project management, task breakdown, and collaboration strategies. Provide time estimates and help coordinate team efforts.`;
-        break;
-        
-      case 'DESIGNER':
-        systemPrompt = `You are a UI/UX Designer AI mentor specializing in user interface design, user experience, styling, and visual aesthetics.
+CRITICAL: You are a DevOps Agent with tool access. You can CREATE repositories, not just talk about them.
 
-Your expertise includes:
-- Creating intuitive and beautiful user interfaces
-- Recommending color schemes, typography, and design systems
-- Suggesting UI frameworks and styling libraries (Tailwind, Material-UI, etc.)
-- Designing user flows and wireframes
-- Ensuring accessibility and responsive design
-- Creating design mockups and component structures
+If the user asks for a 'repo', 'repository', 'workspace', or wants to 'start coding':
+- DO NOT give instructions or explanations
+- DO NOT return JSON objects
+- IMMEDIATELY call the createGitHubRepo tool with an appropriate repoName
+- After the tool executes, respond with: "Repo created! [Link]. You can now launch it in Replit using the [OPEN_WORKSPACE] button."
+
+The repoName should be lowercase, use hyphens, and be descriptive.
+
+Otherwise, focus on project management, task breakdown, Replit collaboration strategies, and timing.`,
+
+      DESIGNER: `You are a UI/UX Designer specialist focused on Tailwind CSS, UI/UX design, and layout.
+
+Your core expertise:
+- Tailwind CSS utility classes and styling patterns
+- UI/UX design principles and best practices
+- Layout design (grid, flexbox, responsive design)
+- Color schemes, typography, and design systems
+- Component design and user flows
+- Accessibility and responsive design patterns
 
 TEAM MEMBERS:
 ${memberSkills}
@@ -1797,12 +2207,19 @@ HACKATHON: ${hackathonName}
 
 ${recentMessages ? `RECENT CONVERSATION:\n${recentMessages}\n\n` : ''}
 
-Focus on UI/UX design, styling recommendations, and visual aesthetics. Help create beautiful and functional user interfaces.`;
-        break;
-        
-      default:
-        // Default mentor (general)
-        systemPrompt = `You are an expert hackathon mentor helping a team plan their project.
+CRITICAL: You are a DevOps Agent with tool access. You can CREATE repositories, not just talk about them.
+
+If the user asks for a 'repo', 'repository', 'workspace', or wants to 'start coding':
+- DO NOT give instructions or explanations
+- DO NOT return JSON objects
+- IMMEDIATELY call the createGitHubRepo tool with an appropriate repoName
+- After the tool executes, respond with: "Repo created! [Link]. You can now launch it in Replit using the [OPEN_WORKSPACE] button."
+
+The repoName should be lowercase, use hyphens, and be descriptive.
+
+Otherwise, focus on Tailwind CSS, UI/UX design, layout, and visual aesthetics.`,
+
+      DEFAULT: `You are an expert hackathon mentor helping a team plan their project.
 
 TEAM MEMBERS:
 ${memberSkills}
@@ -1817,70 +2234,136 @@ Based on the team's combined skills and tech stack${recentMessages ? ' and the r
 3. Three specific project ideas that leverage the team's strengths
 4. A step-by-step 24-hour execution plan broken into phases
 
-IMPORTANT: After suggesting a project, you must provide a call-to-action. If the team is ready to start coding, include a JSON object at the end of your response with:
-{
-  "actionType": "GITHUB_INIT",
-  "project_name": "<suggested project name>",
-  "ready_to_code": true
-}
+CRITICAL: You are a DevOps Agent with tool access. You can CREATE repositories, not just talk about them.
 
-Format your response as a clear, actionable plan that the team can follow immediately. If the team has a clear project idea and is ready to start, set actionType to "GITHUB_INIT".`;
-    }
+If the user asks for a 'repo', 'repository', 'workspace', or wants to 'start coding':
+- DO NOT give instructions or explanations
+- DO NOT return JSON objects
+- IMMEDIATELY call the createGitHubRepo tool with an appropriate repoName
+- After the tool executes, respond with: "Repo created! [Link]. You can now launch it in Replit using the [OPEN_WORKSPACE] button."
+
+The repoName should be lowercase, use hyphens, and be descriptive (e.g., "hackathon-project-name" or "team-collaboration-tool").
+
+Otherwise, format your response as a clear, actionable plan that the team can follow immediately.`
+    };
+    
+    // Get the system prompt based on activeAgent
+    const systemPrompt = specialists[activeAgent] || specialists.DEFAULT;
     
     // Create AI prompt
     const aiPrompt = prompt || systemPrompt;
     
-    console.log(`🤖 Calling Gemini API for AI advice...`);
+    // Define the tool (function) for Gemini Function Calling
+    const tools = [
+      {
+        functionDeclarations: [
+          {
+            name: 'createGitHubRepo',
+            description: 'Creates a new GitHub repository for the team, invites all team members, and sets up a Replit workspace. Use this when the user asks for a repo, repository, workspace, or wants to start coding.',
+            parameters: {
+              type: 'object',
+              properties: {
+                repoName: {
+                  type: 'string',
+                  description: 'The name for the GitHub repository. Should be lowercase, use hyphens, and be descriptive (e.g., "hackathon-vr-app" or "team-collaboration-tool")'
+                },
+                description: {
+                  type: 'string',
+                  description: 'Optional description for the repository'
+                }
+              },
+              required: ['repoName']
+            }
+          }
+        ]
+      }
+    ];
     
-    // Use Gemini 2.5 Flash
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-    const result = await model.generateContent(aiPrompt);
-    const response = await result.response;
-    const aiResponse = response.text().trim();
+    console.log(`🤖 Calling Gemini API with Function Calling...`);
+    
+    // Use Gemini 2.5 Flash with tools
+    const model = genAI.getGenerativeModel({ 
+      model: 'gemini-2.5-flash',
+      tools: tools
+    });
+    
+    // Start a chat session for function calling
+    const chat = model.startChat({
+      history: [],
+      systemInstruction: systemPrompt
+    });
+    
+    // Send the user's message
+    const result = await chat.sendMessage(aiPrompt);
+    const response = result.response;
+    
+    // Check if the model wants to call a function
+    let aiResponse = '';
+    let functionCall = null;
+    
+    if (response.functionCalls() && response.functionCalls().length > 0) {
+      // The AI wants to call a function
+      functionCall = response.functionCalls()[0];
+      console.log(`🔧 AI wants to call function: ${functionCall.name}`);
+      console.log(`📋 Function arguments:`, functionCall.args);
+      
+      if (functionCall.name === 'createGitHubRepo') {
+        try {
+          // Execute the function
+          const repoResult = await createGitHubRepo(
+            teamId,
+            functionCall.args.repoName,
+            functionCall.args.description || null
+          );
+          
+          // Send the function result back to the model
+          const functionResponse = await chat.sendMessage({
+            functionResponse: {
+              name: functionCall.name,
+              response: {
+                success: true,
+                message: `Repository created successfully!`,
+                repository: repoResult.repository,
+                replit_url: repoResult.replit_url
+              }
+            }
+          });
+          
+          // Get the final AI response
+          aiResponse = functionResponse.response.text().trim();
+          console.log(`✅ Function executed, AI response:`, aiResponse);
+        } catch (error) {
+          console.error('❌ Error executing function:', error);
+          // Send error back to model
+          const errorResponse = await chat.sendMessage({
+            functionResponse: {
+              name: functionCall.name,
+              response: {
+                success: false,
+                error: error.message
+              }
+            }
+          });
+          aiResponse = errorResponse.response.text().trim();
+        }
+      }
+    } else {
+      // No function call, just get the text response
+      aiResponse = response.text().trim();
+    }
     
     console.log(`✅ AI response received (length: ${aiResponse.length})`);
     
-    // Try to extract JSON from the response (for actionType flag)
-    let actionType = null;
-    let projectName = null;
-    let cleanedResponse = aiResponse.trim();
-    
-    try {
-      // Look for JSON object at the end of the response
-      const jsonMatch = aiResponse.match(/\{[\s\S]*"actionType"[\s\S]*\}/);
-      if (jsonMatch) {
-        const jsonData = JSON.parse(jsonMatch[0]);
-        actionType = jsonData.actionType || null;
-        projectName = jsonData.project_name || null;
-        // Remove JSON from the text response
-        cleanedResponse = aiResponse.replace(/\{[\s\S]*"actionType"[\s\S]*\}/, '').trim();
-      }
-      // Fallback: check for old github_action format
-      else {
-        const oldJsonMatch = aiResponse.match(/\{[\s\S]*"github_action"[\s\S]*\}/);
-        if (oldJsonMatch) {
-          const jsonData = JSON.parse(oldJsonMatch[0]);
-          if (jsonData.github_action === true) {
-            actionType = 'GITHUB_INIT';
-            projectName = jsonData.project_name || null;
-            cleanedResponse = aiResponse.replace(/\{[\s\S]*"github_action"[\s\S]*\}/, '').trim();
-          }
-        }
-      }
-    } catch (parseError) {
-      console.log('⚠️ Could not parse JSON from AI response, continuing with text only');
-    }
-    
-    // Add AI message to team.messages array using $push
-    // Ensure it's a NEW, SEPARATE object (not appended to existing message)
+    // If a function was called, the repo is already created and message posted
+    // Just add the AI's response message
     const aiMessageObject = {
       senderId: 'ai_bot',
-      text: cleanedResponse,
+      text: aiResponse.trim(),
       timestamp: new Date(),
-      actionType: actionType, // New field: actionType (e.g., 'GITHUB_INIT')
-      project_name: projectName,
-      // Keep github_action for backward compatibility
-      github_action: actionType === 'GITHUB_INIT'
+      // If function was called, mark it
+      action: functionCall ? 'CREATE_REPO' : null,
+      actionType: functionCall ? 'GITHUB_INIT' : null,
+      github_action: functionCall ? true : false
     };
     
     // Update team with $push - this creates a NEW message object in the array

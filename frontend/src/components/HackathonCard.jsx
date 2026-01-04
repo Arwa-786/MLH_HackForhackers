@@ -156,7 +156,7 @@ const HackathonCard = ({ hackathon, onClick, isRegistered }) => {
         <div className="mb-4">
           <p className="text-xs text-[#39ff14] mb-1 font-bold pixel-text">DATES:</p>
           <p className="text-sm font-bold text-white pixel-text">
-            {formatDateRange(hackathon.start_date, hackathon.end_date)}
+            {formatDateRange(hackathon.start_date, hackathon.end_date).replace(/\s*\(day:\s*\d+\)/gi, '')}
           </p>
         </div>
 
