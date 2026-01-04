@@ -2,6 +2,8 @@ import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import { useNavigate } from 'react-router-dom';
 import HackathonCard from '../components/HackathonCard';
+import GroupsPanel from '../components/GroupsPanel';
+import ChatPanel from '../components/ChatPanel';
 
 const HackathonList = () => {
   const [hackathons, setHackathons] = useState([]);
@@ -11,6 +13,10 @@ const HackathonList = () => {
   const [selectedHackathon, setSelectedHackathon] = useState(null);
   const [currentUser, setCurrentUser] = useState(null);
   const [showProfileMenu, setShowProfileMenu] = useState(false);
+  const [showGroupsPanel, setShowGroupsPanel] = useState(false);
+  const [selectedTeam, setSelectedTeam] = useState(null);
+  const [showChat, setShowChat] = useState(false);
+  const [currentUserName, setCurrentUserName] = useState('');
   const navigate = useNavigate();
   const CURRENT_USER_ID = '6958c084d6d4ea1f109dad70'; // Hardcoded current user ID
 
@@ -23,9 +29,16 @@ const HackathonList = () => {
     try {
       const response = await axios.get(`http://localhost:3000/api/users/${CURRENT_USER_ID}`);
       setCurrentUser(response.data);
+      setCurrentUserName(response.data?.name || 'User');
     } catch (err) {
       console.error('Error fetching current user:', err);
     }
+  };
+
+  const handleSelectTeam = (team) => {
+    setSelectedTeam(team);
+    setShowChat(true);
+    setShowGroupsPanel(false);
   };
 
   const fetchHackathons = async () => {
@@ -149,6 +162,25 @@ const HackathonList = () => {
         <div className="absolute top-0 left-0 w-full h-full bg-gradient-to-br from-[#39ff14]/5 via-transparent to-transparent"></div>
         <div className="absolute bottom-0 right-0 w-96 h-96 bg-[#39ff14]/5 rounded-full blur-3xl"></div>
       </div>
+
+      {/* Groups Button - Top left, disappears when panel is open */}
+      {!showGroupsPanel && (
+        <button
+          onClick={() => setShowGroupsPanel(true)}
+          className="fixed left-4 top-4 z-40 code-bg p-3 border-2 border-[#39ff14]/50 text-[#39ff14] hover:bg-[#39ff14]/10 hover:border-[#39ff14] transition-all pixel-text font-bold text-sm rounded-lg shadow-lg"
+          title="View Groups"
+        >
+          <div className="flex flex-col items-center gap-1">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+              <circle cx="9" cy="7" r="4"></circle>
+              <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+              <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+            </svg>
+            <span className="text-xs">GROUPS</span>
+          </div>
+        </button>
+      )}
       
       {/* Profile Menu - Top Right */}
       <div className="absolute top-4 right-4 z-50">
@@ -192,7 +224,7 @@ const HackathonList = () => {
         </div>
       </div>
       
-      <div className="max-w-7xl mx-auto py-12 px-4 relative z-10">
+      <div className={`max-w-7xl mx-auto py-12 px-4 relative z-10 transition-all duration-300 ${showGroupsPanel ? 'ml-80' : ''} ${showChat ? 'mr-80' : ''}`}>
         {/* Header */}
         <div className="text-center mb-12">
           <div className="text-left mb-4 text-[#39ff14] text-sm pixel-text">
@@ -306,6 +338,29 @@ const HackathonList = () => {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Groups Panel */}
+      {showGroupsPanel && (
+        <GroupsPanel
+          currentUserId={CURRENT_USER_ID}
+          onSelectTeam={handleSelectTeam}
+          selectedTeamId={selectedTeam?._id}
+          onClose={() => setShowGroupsPanel(false)}
+        />
+      )}
+
+      {/* Chat Panel */}
+      {showChat && selectedTeam && (
+        <ChatPanel
+          team={selectedTeam}
+          currentUserId={CURRENT_USER_ID}
+          currentUserName={currentUserName}
+          onClose={() => {
+            setShowChat(false);
+            setSelectedTeam(null);
+          }}
+        />
       )}
     </div>
   );

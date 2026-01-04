@@ -25,6 +25,9 @@ if (!process.env.MONGODB_URI) {
   process.exit(1);
 }
 
+// Enable Mongoose debug mode to see queries (optional, can disable in production)
+// mongoose.set('debug', true);
+
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('✅ Connected to MongoDB'))
   .catch(err => {
@@ -38,7 +41,9 @@ mongoose.connect(process.env.MONGODB_URI)
   });
 
 // User Schema
+// Note: _id is explicitly defined as String since MongoDB stores IDs as strings in this database
 const UserSchema = new mongoose.Schema({
+  _id: { type: String, required: true },
   name: String,
   email: String,
   role_preference: String,
@@ -51,8 +56,9 @@ const UserSchema = new mongoose.Schema({
   school: String,
   location: String,
   description: String,
+  bio: String, // Support both description and bio fields
   registered_hackathons: [String] // Array of hackathon IDs
-});
+}, { _id: true }); // Explicitly enable _id field
 
 const User = mongoose.model('User', UserSchema);
 
@@ -87,6 +93,7 @@ const Hackathon = mongoose.model('Hackathon', HackathonSchema);
 // Team Schema
 const TeamSchema = new mongoose.Schema({
   hackathon_id: String,
+  name: String, // Team name (e.g., "Team 1", "Team 2")
   members: [{ type: String, ref: 'User' }],
   needed_roles: [String],
   is_full: { type: Boolean, default: false },
@@ -94,6 +101,18 @@ const TeamSchema = new mongoose.Schema({
 });
 
 const Team = mongoose.model('Team', TeamSchema);
+
+// Message Schema
+const MessageSchema = new mongoose.Schema({
+  team_id: String,
+  user_id: String,
+  user_name: String, // Store name for quick access
+  message: String,
+  is_ai: { type: Boolean, default: false }, // True if message is from AI bot
+  created_at: { type: Date, default: Date.now }
+});
+
+const Message = mongoose.model('Message', MessageSchema);
 
 // Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
@@ -104,7 +123,7 @@ if (!process.env.GEMINI_API_KEY) {
 }
 
 // Helper function to get model
-function getModel(modelName = 'gemini-1.5-flash') {
+function getModel(modelName = 'gemini-2.5-flash') {
   return genAI.getGenerativeModel({ model: modelName });
 }
 
@@ -118,10 +137,12 @@ async function getWorkingModel() {
   const testPrompt = 'test';
   // Try these models in order (most common first)
   const modelsToTry = [
-    'gemini-1.5-flash',
+    'gemini-2.5-flash',
+    'gemini-2.5-pro',
     'gemini-1.5-pro', 
     'gemini-pro',
-    'models/gemini-1.5-flash',
+    'models/gemini-2.5-flash',
+    'models/gemini-2.5-pro',
     'models/gemini-1.5-pro',
     'models/gemini-pro'
   ];
@@ -154,8 +175,8 @@ async function getWorkingModel() {
 // AI Matchmaking Helper Functions
 async function calculateMatchScore(user1, user2, teamMembers = null) {
   try {
-    // Use gemini-1.5-flash which is available in v1beta API
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    // Use gemini-2.5-flash
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
     let prompt;
 
@@ -165,34 +186,55 @@ async function calculateMatchScore(user1, user2, teamMembers = null) {
       const teamTechStack = teamMembers.map(m => m.tech_stack || []).flat();
       const teamExperience = teamMembers.map(m => m.experience || []).flat();
 
-      prompt = `You are an AI team matchmaking system for hackathons. Evaluate how well a candidate user would complement an existing team.
+      prompt = `You are a STRICT TECHNICAL RECRUITER evaluating a hackathon team candidate. Be harsh and precise.
 
 EXISTING TEAM:
 - Combined Skills: ${[...new Set(teamSkills)].join(', ') || 'None'}
 - Tech Stack: ${[...new Set(teamTechStack)].join(', ') || 'None'}
 - Experience: ${[...new Set(teamExperience)].join(', ') || 'None'}
 - Team Size: ${teamMembers.length} members
+- Primary Roles: ${teamMembers.map(m => m.role_preference || 'Unspecified').join(', ')}
 
 CANDIDATE USER:
 - Name: ${user2.name || 'Unknown'}
+- Primary Role: ${user2.role_preference || 'Unspecified'}
 - Skills: ${(user2.skills || []).join(', ') || 'None listed'}
 - Tech Stack: ${(user2.tech_stack || []).join(', ') || 'None listed'}
 - Experience: ${(user2.experience || []).join(', ') || 'None listed'}
-- School: ${user2.school || 'Not specified'}
-- Location: ${user2.location || 'Not specified'}
 
-EVALUATION CRITERIA:
-1. Role Complementarity: Does this candidate fill gaps in the team? (e.g., if team has 2 coders, prioritize a Designer)
-2. Tech Stack Alignment: Can they work with the team's existing tech stack?
-3. Skill Diversity: Do they add unique value without too much overlap?
-4. Team Balance: Will they help create a well-rounded 4-person team?
+STRICT EVALUATION RULES:
 
-Respond with a JSON object in this exact format:
+1. ROLE CHECK (CRITICAL):
+   - If candidate's primary role matches ANY existing team member's role EXACTLY (e.g., both are ONLY "Frontend"), apply -30% penalty for "Skill Redundancy"
+   - Only award points if candidate fills a MISSING role (e.g., team has Frontend/Backend, candidate is Designer = GOOD)
+
+2. STACK SYNERGY (ONLY COMPLEMENTARY):
+   - Award points ONLY for complementary tech stacks:
+     * Node.js (Backend) + React (Frontend) = +40%
+     * Python (Backend) + React (Frontend) = +40%
+     * Unity (Game) + Backend API = +40%
+   - DO NOT award points for overlapping stacks (e.g., both have React = -20%)
+   - If candidate's tech stack perfectly complements team's gaps, award +40%
+
+3. SCORE SCALE (BE STRICT):
+   - 90-100%: "Dream Team" - Perfect full-stack coverage (Frontend + Backend + Design + DevOps/Mobile), NO role overlap, complementary tech stacks
+   - 70-89%: "Strong Match" - 1-2 minor skill overlaps, but fills critical missing role
+   - 40-69%: "Average Match" - Too much overlap OR missing a key role (e.g., no Backend, no Design)
+   - Below 40%: "Weak Match" - Exact same skills/role OR no tech stack provided
+
+4. REASONING FORMAT (REQUIRED):
+   - List exactly ONE "Pros" (what makes this a good match)
+   - List exactly ONE "Major Risk" (what could go wrong)
+
+IMPORTANT: Only return "Strong Match" (score >= 85) or "Good Match" (score >= 60). 
+If the match score is below 60, still return the score but set category to "Good Match".
+
+Respond with ONLY a JSON object (no markdown, no code blocks):
 {
   "score": <number 0-100>,
-  "reason": "<brief explanation of why this is a good/bad match>",
-  "category": "<Strong|Good|Okay|Bad>",
-  "needed_roles": ["<role1>", "<role2>"] (what roles the team needs)
+  "reason": "Pros: <exactly one pro>. Major Risk: <exactly one risk>",
+  "category": "<Strong Match|Good Match>",
+  "needed_roles": ["<role1>", "<role2>"]
 }`;
     } else {
       // One-on-one matching with Current User logic
@@ -203,72 +245,109 @@ Respond with a JSON object in this exact format:
         // Current User: Full Stack, VR, AI Engineering (Unity, Swift, Python)
         // High scores for: Backend (Node.js/Go), 3D Modeling, Design
         // Low scores for: Only Swift/Unity (skill overlap)
-        prompt = `You are a HARSH hackathon judge. Do NOT give neutral scores. Be aggressive in your scoring.
+        prompt = `You are a STRICT TECHNICAL RECRUITER evaluating a hackathon teammate match. Be harsh and precise.
 
 CURRENT USER (Me):
 - Name: ${user1.name || 'Unknown'}
+- Primary Role: ${user1.role_preference || 'Full Stack'}
 - Skills: ${(user1.skills || []).join(', ') || 'Full Stack, VR, AI Engineering'}
 - Tech Stack: ${(user1.tech_stack || []).join(', ') || 'Unity, Swift, Python'}
 - Experience: ${(user1.experience || []).join(', ') || 'VR development, Mobile apps, AI/ML'}
-- Bio: ${user1.description || 'Full Stack developer specializing in VR and AI'}
-- Role: ${user1.role_preference || 'Full Stack'}
+- Bio: ${user1.description || user1.bio || 'Full Stack developer specializing in VR and AI'}
 
 TARGET USER:
 - Name: ${user2.name || 'Unknown'}
+- Primary Role: ${user2.role_preference || 'Not specified'}
 - Skills: ${(user2.skills || []).join(', ') || 'None listed'}
 - Tech Stack: ${(user2.tech_stack || []).join(', ') || 'None listed'}
 - Experience: ${(user2.experience || []).join(', ') || 'None listed'}
-- Bio: ${user2.description || 'No bio provided'}
-- Role: ${user2.role_preference || 'Not specified'}
+- Bio: ${user2.description || user2.bio || 'No bio provided'}
 
-SCORING RULES (BE STRICT):
-1. Score ABOVE 90%: Skills are PERFECTLY complementary (e.g., Unity/VR vs. Go/Backend, Swift/Mobile vs. Node.js/Backend, Python/AI vs. 3D Modeling/Design)
-2. Score 60-85%: Skills are somewhat complementary but not perfect
-3. Score BELOW 40%: Skills are nearly IDENTICAL (e.g., both know Swift/Unity, both know Python/AI with same focus)
-4. DO NOT give scores around 50% - be decisive!
+STRICT EVALUATION RULES:
 
-Examples:
-- Unity + Swift (current) vs. Go + Node.js (target) = 95% (perfect complement)
-- Unity + Swift (current) vs. Swift + Unity (target) = 30% (too similar)
-- Unity + Swift (current) vs. React + Frontend (target) = 70% (somewhat complementary)
+1. ROLE CHECK (CRITICAL):
+   - If both users have the SAME primary role (e.g., both are ONLY "Frontend"), apply -30% penalty for "Skill Redundancy"
+   - Only award high scores if roles are complementary (e.g., Frontend + Backend, Developer + Designer)
+
+2. STACK SYNERGY (ONLY COMPLEMENTARY):
+   - Award points ONLY for complementary tech stacks:
+     * Unity/Swift (Mobile/VR) + Node.js/Go (Backend) = +40%
+     * Python (Backend) + React (Frontend) = +40%
+     * Unity (Game) + Backend API = +40%
+   - DO NOT award points for overlapping stacks (e.g., both have Unity/Swift = -30% penalty)
+   - If tech stacks perfectly complement each other, award +40%
+
+3. SCORE SCALE (BE STRICT):
+   - 90-100%: "Dream Team" - Perfect full-stack coverage, NO role overlap, complementary tech stacks (e.g., Unity/Swift + Node.js/Go + React + Design)
+   - 70-89%: "Strong Match" - 1-2 minor skill overlaps, but fills critical missing role (e.g., Frontend + Backend)
+   - 40-69%: "Average Match" - Too much overlap OR missing a key role (e.g., both Frontend, no Backend)
+   - Below 40%: "Weak Match" - Exact same skills/role OR no tech stack provided
+
+4. REASONING FORMAT (REQUIRED):
+   - List exactly ONE "Pros" (what makes this a good match)
+   - List exactly ONE "Major Risk" (what could go wrong)
+
+IMPORTANT: Only return "Strong Match" (score >= 85) or "Good Match" (score >= 60). 
+If the match score is below 60, still return the score but set category to "Good Match".
 
 Respond with ONLY a JSON object (no markdown, no code blocks):
 {
   "score": <number 0-100>,
-  "reason": "<brief 1-sentence explanation why this is a good/bad match>",
-  "category": "<Strong Match|Good Match|Okay Match>"
+  "reason": "Pros: <exactly one pro>. Major Risk: <exactly one risk>",
+  "category": "<Strong Match|Good Match>"
 }`;
       } else {
         // Generic matching
-        prompt = `You are a HARSH hackathon judge. Do NOT give neutral scores. Be aggressive in your scoring.
+        prompt = `You are a STRICT TECHNICAL RECRUITER evaluating a hackathon teammate match. Be harsh and precise.
 
 USER 1:
 - Name: ${user1.name || 'Unknown'}
+- Primary Role: ${user1.role_preference || 'Not specified'}
 - Skills: ${(user1.skills || []).join(', ') || 'None listed'}
 - Tech Stack: ${(user1.tech_stack || []).join(', ') || 'None listed'}
 - Experience: ${(user1.experience || []).join(', ') || 'None listed'}
-- Bio: ${user1.description || 'No bio provided'}
-- Role: ${user1.role_preference || 'Not specified'}
+- Bio: ${user1.description || user1.bio || 'No bio provided'}
 
 USER 2:
 - Name: ${user2.name || 'Unknown'}
+- Primary Role: ${user2.role_preference || 'Not specified'}
 - Skills: ${(user2.skills || []).join(', ') || 'None listed'}
 - Tech Stack: ${(user2.tech_stack || []).join(', ') || 'None listed'}
 - Experience: ${(user2.experience || []).join(', ') || 'None listed'}
-- Bio: ${user2.description || 'No bio provided'}
-- Role: ${user2.role_preference || 'Not specified'}
+- Bio: ${user2.description || user2.bio || 'No bio provided'}
 
-SCORING RULES (BE STRICT):
-1. Score ABOVE 90%: Skills are PERFECTLY complementary (e.g., Frontend + Backend, Designer + Developer)
-2. Score 60-85%: Skills are somewhat complementary but not perfect
-3. Score BELOW 40%: Skills are nearly IDENTICAL (avoid duplication)
-4. DO NOT give scores around 50% - be decisive!
+STRICT EVALUATION RULES:
+
+1. ROLE CHECK (CRITICAL):
+   - If both users have the SAME primary role (e.g., both are ONLY "Frontend"), apply -30% penalty for "Skill Redundancy"
+   - Only award high scores if roles are complementary (e.g., Frontend + Backend, Developer + Designer)
+
+2. STACK SYNERGY (ONLY COMPLEMENTARY):
+   - Award points ONLY for complementary tech stacks:
+     * Node.js/Go (Backend) + React/Vue (Frontend) = +40%
+     * Python (Backend) + React (Frontend) = +40%
+     * Unity (Game) + Backend API = +40%
+   - DO NOT award points for overlapping stacks (e.g., both have React = -20%)
+   - If tech stacks perfectly complement each other, award +40%
+
+3. SCORE SCALE (BE STRICT):
+   - 90-100%: "Dream Team" - Perfect full-stack coverage, NO role overlap, complementary tech stacks
+   - 70-89%: "Strong Match" - 1-2 minor skill overlaps, but fills critical missing role
+   - 40-69%: "Average Match" - Too much overlap OR missing a key role (e.g., both Frontend, no Backend)
+   - Below 40%: "Weak Match" - Exact same skills/role OR no tech stack provided
+
+4. REASONING FORMAT (REQUIRED):
+   - List exactly ONE "Pros" (what makes this a good match)
+   - List exactly ONE "Major Risk" (what could go wrong)
+
+IMPORTANT: Only return "Strong Match" (score >= 85) or "Good Match" (score >= 60). 
+If the match score is below 60, still return the score but set category to "Good Match".
 
 Respond with ONLY a JSON object (no markdown, no code blocks):
 {
   "score": <number 0-100>,
-  "reason": "<brief explanation>",
-  "category": "<Strong Match|Good Match|Okay Match>"
+  "reason": "Pros: <exactly one pro>. Major Risk: <exactly one risk>",
+  "category": "<Strong Match|Good Match>"
 }`;
       }
     }
@@ -329,14 +408,13 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
 
     console.log(`📊 Final match score: ${score}%`);
 
-    // Normalize category to match expected format
-    let category = matchData.category || 'Okay Match';
-    if (score >= 90) {
+    // Normalize category to match expected format - only Strong Match or Good Match
+    let category = matchData.category || 'Good Match';
+    if (score >= 85) {
       category = 'Strong Match';
-    } else if (score >= 60) {
-      category = 'Good Match';
     } else {
-      category = 'Okay Match';
+      // For scores below 85, always show as "Good Match" (we only display Strong and Good)
+      category = 'Good Match';
     }
     
     return {
@@ -350,7 +428,7 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
     return {
       score: 50,
       reason: 'Error calculating match score',
-      category: 'Okay',
+      category: 'Good Match',
       needed_roles: []
     };
   }
@@ -813,65 +891,84 @@ app.post('/api/onboarding/save', async (req, res) => {
 // POST /match-score - AI Matchmaking endpoint
 app.post('/match-score', async (req, res) => {
   try {
-    let { currentUser, targetUser, user1_id, user2_id, team_member_ids } = req.body;
+    let { currentUser, targetUser, user1_id, user2_id, team_member_ids, hackathon_id } = req.body;
 
     console.log(`🔍 POST /match-score request received`);
+    console.log(`📋 Request body:`, { user1_id, user2_id, hasCurrentUser: !!currentUser, hasTargetUser: !!targetUser });
 
     // 1. Resolve Users: Handle both Direct Objects (from Prompt) and IDs (from Frontend)
+    // Since _id is stored as String in the database, search directly as string
+    const findUser = async (id) => {
+      if (!id) return null;
+      
+      // Convert to string and search directly (no ObjectId conversion needed)
+      const stringId = id.toString();
+      console.log(`   🔍 Searching for ID as string: ${stringId}`);
+      
+      // Use findOne with string _id (since schema defines _id as String)
+      let user = await User.findOne({ _id: stringId }).lean();
+      
+      // If not found, try findById as fallback (Mongoose may still handle it)
+      if (!user) {
+        user = await User.findById(stringId).lean();
+      }
+      
+      return user;
+    };
+
     if (!currentUser && user1_id) {
-      currentUser = await User.findById(user1_id) || await User.findOne({ _id: user1_id });
+      console.log(`🔍 Looking up user1_id: ${user1_id} (type: ${typeof user1_id})`);
+      currentUser = await findUser(user1_id);
+      console.log(`✅ User1 found: ${currentUser ? currentUser.name : 'NOT FOUND'}`);
+      
+      if (!currentUser) {
+        // Debug: show what IDs exist in database
+        const sampleUsers = await User.find({}).limit(3).select('_id name').lean();
+        console.log(`   Sample user IDs in DB:`, sampleUsers.map(u => ({ 
+          id: u._id.toString(), 
+          idType: u._id.constructor.name,
+          name: u.name 
+        })));
+      }
     }
+    
     if (!targetUser && user2_id) {
-      targetUser = await User.findById(user2_id) || await User.findOne({ _id: user2_id });
+      console.log(`🔍 Looking up user2_id: ${user2_id} (type: ${typeof user2_id})`);
+      targetUser = await findUser(user2_id);
+      console.log(`✅ User2 found: ${targetUser ? targetUser.name : 'NOT FOUND'}`);
+      
+      if (!targetUser) {
+        // Debug: show what IDs exist in database
+        const sampleUsers = await User.find({}).limit(3).select('_id name').lean();
+        console.log(`   Sample user IDs in DB:`, sampleUsers.map(u => ({ 
+          id: u._id.toString(), 
+          idType: u._id.constructor.name,
+          name: u.name 
+        })));
+      }
     }
 
     // Validation
     if (!currentUser || !targetUser) {
       console.error('❌ Missing users for matchmaking');
+      console.error(`   user1_id: ${user1_id}, found: ${!!currentUser}`);
+      console.error(`   user2_id: ${user2_id}, found: ${!!targetUser}`);
       return res.status(404).json({ error: 'Users not found', details: 'Provide currentUser/targetUser objects OR user1_id/user2_id' });
     }
 
     console.log(`✅ Matchmaking for: ${currentUser.name} vs ${targetUser.name}`);
 
-    // 2. Prepare Matchmaking Logic
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-    // Construct the requested System Prompt
-    const prompt = `You are a hackathon matchmaking agent. Compare the skills and roles of User A and User B. 
-    
-    User A (Current User):
-    - Role: ${currentUser.role_preference || 'Unspecified'}
-    - Skills: ${Array.isArray(currentUser.skills) ? currentUser.skills.join(', ') : currentUser.skills || 'None'}
-    - Tech Stack: ${Array.isArray(currentUser.tech_stack) ? currentUser.tech_stack.join(', ') : currentUser.tech_stack || 'None'}
-    
-    User B (Target User):
-    - Role: ${targetUser.role_preference || 'Unspecified'}
-    - Skills: ${Array.isArray(targetUser.skills) ? targetUser.skills.join(', ') : targetUser.skills || 'None'}
-    - Tech Stack: ${Array.isArray(targetUser.tech_stack) ? targetUser.tech_stack.join(', ') : targetUser.tech_stack || 'None'}
-
-    If User A is a VR/Mobile dev (Unity/Swift) and User B is a Backend/Cloud dev (Go/Node/Kubernetes), give a score > 90%. 
-    If they overlap (both Unity), give a score < 40%. 
-    
-    Return ONLY JSON: {"score": number, "reason": "string", "category": "Strong Match|Good Match|Okay Match"}`;
-
-    // 3. Call Gemini API
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const text = response.text().trim();
-
-    console.log(`🤖 Gemini JSON Response: ${text}`);
-
-    // 4. Parse JSON Securely
-    let matchData;
-    try {
-      const cleanedText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-      matchData = JSON.parse(cleanedText);
-    } catch (parseError) {
-      console.error('❌ Failed to parse Gemini response:', text);
-      // Fallback if AI fails to return valid JSON
-      return res.json({ score: 50, reason: "AI response error, defaulting score.", category: "Okay Match" });
+    // 2. Get team members if team_member_ids provided
+    let teamMembers = null;
+    if (team_member_ids && team_member_ids.length > 0) {
+      teamMembers = await User.find({ _id: { $in: team_member_ids } });
+      console.log(`👥 Team members: ${teamMembers.length}`);
     }
 
+    // 3. Use the existing calculateMatchScore function which handles team-based matching
+    const matchData = await calculateMatchScore(currentUser, targetUser, teamMembers);
+    
+    console.log(`📊 Match result: ${matchData.score}% - ${matchData.category}`);
     res.json(matchData);
 
   } catch (error) {
@@ -911,22 +1008,73 @@ app.post('/request', async (req, res) => {
 });
 
 // GET /team/:userId - Get user's team
-// GET /team/:userId - Get user's team
-app.get('/team/:userId', async (req, res) => {
+// GET /api/teams/:userId - Get all teams user is a member of
+app.get('/api/teams/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-
-    console.log(`🔍 GET /team/:userId - userId: ${userId}`);
 
     if (!userId) {
       return res.status(400).json({ error: 'userId is required' });
     }
 
-    // Find team where user is a member (check both string and ObjectId)
-    const team = await Team.findOne({
-      members: { $in: [userId, new mongoose.Types.ObjectId(userId)] },
-      is_full: false
-    });
+    // Find all teams where user is a member
+    const teams = await Team.find({
+      members: { $in: [userId, new mongoose.Types.ObjectId(userId)] }
+    }).sort({ created_at: -1 });
+
+    // Get hackathon and member details for each team
+    const teamsWithDetails = await Promise.all(
+      teams.map(async (team) => {
+        const hackathon = await Hackathon.findById(team.hackathon_id);
+        const members = await User.find({ _id: { $in: team.members } });
+        
+        return {
+          ...team.toObject(),
+          hackathon: hackathon ? {
+            name: hackathon.name,
+            location: hackathon.location
+          } : null,
+          memberDetails: members.map(m => ({
+            _id: m._id,
+            name: m.name,
+            skills: m.skills,
+            tech_stack: m.tech_stack
+          }))
+        };
+      })
+    );
+
+    res.json(teamsWithDetails);
+  } catch (error) {
+    console.error('Error fetching teams:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /team/:userId - Get user's team (for current hackathon)
+app.get('/team/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { hackathonId } = req.query;
+
+    console.log(`🔍 GET /team/:userId - userId: ${userId}, hackathonId: ${hackathonId}`);
+
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+
+    // Build query
+    const query = {
+      members: { $in: [userId, new mongoose.Types.ObjectId(userId)] }
+    };
+
+    // If hackathonId is provided, filter by it
+    if (hackathonId) {
+      query.hackathon_id = hackathonId;
+    }
+
+    // Find team where user is a member
+    const team = await Team.findOne(query);
 
     console.log(`📋 Team found: ${!!team}`);
 
@@ -1085,6 +1233,43 @@ app.get('/api/requests/:userId', async (req, res) => {
   }
 });
 
+// GET /api/requests/incoming/:userId - Get incoming requests for a user
+app.get('/api/requests/incoming/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const incomingRequests = await Request.find({
+      to_user_id: userId,
+      status: 'pending'
+    });
+    
+    // Fetch user data for each request
+    const requestsWithUsers = await Promise.all(
+      incomingRequests.map(async (request) => {
+        const user = await User.findById(request.from_user_id);
+        return {
+          ...request.toObject(),
+          from_user_id: user ? {
+            _id: user._id,
+            name: user.name,
+            email: user.email,
+            skills: user.skills,
+            tech_stack: user.tech_stack,
+            github: user.github,
+            school: user.school,
+            location: user.location
+          } : null
+        };
+      })
+    );
+    
+    res.json(requestsWithUsers);
+  } catch (error) {
+    console.error('Error fetching incoming requests:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
@@ -1109,7 +1294,8 @@ app.get('/test-gemini', async (req, res) => {
     console.log('🔍 Testing Gemini API key...');
     const testPrompt = 'Say "Hello"';
     const modelsToTry = [
-      'gemini-1.5-flash',
+      'gemini-2.5-flash',
+      'gemini-2.5-pro',
       'gemini-1.5-pro', 
       'gemini-pro'
     ];
@@ -1176,6 +1362,12 @@ app.listen(PORT, () => {
   console.log(`   PUT  /api/users/:id`);
   console.log(`   GET  /hackathons`);
   console.log(`   POST /team`);
+  console.log(`   POST /requests/:requestId/accept`);
+  console.log(`   GET  /chat/:teamId/messages`);
+  console.log(`   POST /chat/:teamId/messages`);
+  console.log(`   POST /chat/:teamId/ai-advice`);
+  console.log(`   GET  /api/requests/incoming/:userId`);
+  console.log(`   GET  /api/teams/:userId`);
   console.log(`\n✅ All routes registered successfully!`);
 });
 

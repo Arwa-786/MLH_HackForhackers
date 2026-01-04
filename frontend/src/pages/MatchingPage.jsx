@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
 import { useParams, useNavigate } from 'react-router-dom';
+import ChatPanel from '../components/ChatPanel';
+import GroupsPanel from '../components/GroupsPanel';
 
 export default function MatchingPage() {
   const { hackathonId } = useParams();
@@ -29,11 +31,68 @@ export default function MatchingPage() {
   const [neededRoles, setNeededRoles] = useState([]);
   const [matchScores, setMatchScores] = useState({});
   const [calculatingScores, setCalculatingScores] = useState(new Set());
+  const [showChat, setShowChat] = useState(false);
+  const [currentUserName, setCurrentUserName] = useState('');
+  const [incomingRequests, setIncomingRequests] = useState([]);
+  const [showRequestsModal, setShowRequestsModal] = useState(false);
+  const [showGroupsPanel, setShowGroupsPanel] = useState(false);
+  const [selectedTeam, setSelectedTeam] = useState(null);
 
   useEffect(() => {
     fetchUsers();
     fetchTeam();
+    fetchCurrentUser();
+    fetchIncomingRequests();
   }, [hackathonId]); // Re-fetch when hackathonId changes
+
+  const fetchIncomingRequests = async () => {
+    try {
+      const response = await axios.get(`http://localhost:3000/api/requests/incoming/${CURRENT_USER_ID}`);
+      setIncomingRequests(response.data || []);
+    } catch (error) {
+      console.error('Error fetching incoming requests:', error);
+    }
+  };
+
+  const handleAcceptRequest = async (requestId) => {
+    try {
+      const response = await axios.post(`http://localhost:3000/requests/${requestId}/accept`, {
+        current_user_id: CURRENT_USER_ID
+      });
+      
+      // Refresh team and requests
+      await fetchTeam();
+      await fetchIncomingRequests();
+      setShowRequestsModal(false);
+      
+      // Open groups panel and select the new team
+      if (response.data.team) {
+        setSelectedTeam(response.data.team);
+        setShowGroupsPanel(true);
+        setShowChat(true);
+      }
+      
+      alert('Request accepted! Team created.');
+    } catch (error) {
+      console.error('Error accepting request:', error);
+      alert('Error accepting request: ' + (error.response?.data?.error || error.message));
+    }
+  };
+
+  const handleSelectTeam = (team) => {
+    setSelectedTeam(team);
+    setShowChat(true);
+    setShowGroupsPanel(false);
+  };
+
+  const fetchCurrentUser = async () => {
+    try {
+      const response = await axios.get(`http://localhost:3000/api/users/${CURRENT_USER_ID}`);
+      setCurrentUserName(response.data?.name || 'User');
+    } catch (err) {
+      console.error('Error fetching current user:', err);
+    }
+  };
 
   useEffect(() => {
     if (users.length > 0) {
@@ -113,7 +172,7 @@ export default function MatchingPage() {
           const fallbackData = {
             score: 50,
             reason: 'Score calculation failed',
-            category: 'Okay Match'
+            category: 'Good Match'
           };
           setMatchScores(prev => ({ ...prev, [user._id]: fallbackData }));
           return { userId: user._id, data: fallbackData };
@@ -217,10 +276,8 @@ export default function MatchingPage() {
         return 'bg-[#39ff14] text-black border-2 border-[#39ff14] code-glow';
       case 'good':
         return 'bg-[#39ff14]/50 text-[#39ff14] border-2 border-[#39ff14]/50';
-      case 'okay':
-        return 'bg-yellow-500/50 text-yellow-400 border-2 border-yellow-500/50';
       default:
-        return 'bg-gray-500/50 text-gray-400 border-2 border-gray-500/50';
+        return 'bg-[#39ff14]/50 text-[#39ff14] border-2 border-[#39ff14]/50';
     }
   };
 
@@ -308,7 +365,26 @@ export default function MatchingPage() {
         <div className="absolute bottom-0 right-0 w-96 h-96 bg-[#39ff14]/5 rounded-full blur-3xl"></div>
       </div>
 
-      <div className="max-w-6xl mx-auto relative z-10">
+      {/* Groups Button - Top left, disappears when panel is open */}
+      {!showGroupsPanel && (
+        <button
+          onClick={() => setShowGroupsPanel(true)}
+          className="fixed left-4 top-4 z-40 code-bg p-3 border-2 border-[#39ff14]/50 text-[#39ff14] hover:bg-[#39ff14]/10 hover:border-[#39ff14] transition-all pixel-text font-bold text-sm rounded-lg shadow-lg"
+          title="View Groups"
+        >
+          <div className="flex flex-col items-center gap-1">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+              <circle cx="9" cy="7" r="4"></circle>
+              <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+              <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+            </svg>
+            <span className="text-xs">GROUPS</span>
+          </div>
+        </button>
+      )}
+
+      <div className={`max-w-6xl mx-auto relative z-10 transition-all duration-300 ${showGroupsPanel ? 'ml-80' : ''} ${showChat ? 'mr-80' : ''}`}>
         {/* Back Button */}
         <button
           onClick={() => navigate('/hackathons')}
@@ -332,6 +408,17 @@ export default function MatchingPage() {
                 // REQUESTS: <span className="text-[#39ff14]">{requestsSent}/5</span>
               </p>
             </div>
+            {incomingRequests.length > 0 && (
+              <button
+                onClick={() => setShowRequestsModal(true)}
+                className="code-bg px-4 py-2 border-2 border-[#39ff14]/50 text-[#39ff14] hover:bg-[#39ff14]/10 transition-all pixel-text font-bold text-sm relative"
+              >
+                INCOMING_REQUESTS()
+                <span className="absolute -top-1 -right-1 bg-[#39ff14] text-black text-xs px-2 py-0.5 rounded-full font-bold">
+                  {incomingRequests.length}
+                </span>
+              </button>
+            )}
             {team && (
               <div className="code-bg px-4 py-2 border-2 border-[#39ff14]/50">
                 <p className="text-white/80 text-sm font-bold pixel-text">
@@ -573,7 +660,7 @@ export default function MatchingPage() {
                         </div>
                       )}
                       
-                      {matchData && (
+                      {matchData && (matchData.category === 'Strong Match' || matchData.category === 'Good Match') && (
                         <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-bold pixel-text ${getCategoryColor(matchData.category)}`}>
                           {matchData.category}
                         </span>
@@ -606,7 +693,7 @@ export default function MatchingPage() {
                   <Avatar name={selectedUser.name} size={100} />
                   <div>
                     <h2 className="text-3xl font-bold text-white mb-1 pixel-text code-glow">{selectedUser.name}</h2>
-                    {matchScores[selectedUser._id] && (
+                    {matchScores[selectedUser._id] && (matchScores[selectedUser._id].category === 'Strong Match' || matchScores[selectedUser._id].category === 'Good Match') && (
                       <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-bold pixel-text ${getCategoryColor(matchScores[selectedUser._id].category)}`}>
                         {matchScores[selectedUser._id].category}
                       </span>
@@ -795,6 +882,100 @@ export default function MatchingPage() {
           </div>
         )}
       </div>
+
+      {/* Incoming Requests Modal */}
+      {showRequestsModal && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-md flex items-center justify-center z-50 p-4">
+          <div className="code-bg p-8 max-w-2xl w-full border-2 border-[#39ff14] max-h-[90vh] overflow-y-auto">
+            <div className="text-[#39ff14] text-sm mb-4 pixel-text">// INCOMING_REQUESTS</div>
+            <h2 className="text-2xl font-bold text-white mb-6 pixel-text code-glow">
+              TEAM REQUESTS
+            </h2>
+            
+            {incomingRequests.length === 0 ? (
+              <p className="text-white/60 pixel-text">No pending requests</p>
+            ) : (
+              <div className="space-y-4">
+                {incomingRequests.map((request) => {
+                  const sender = request.from_user_id;
+                  return (
+                    <div
+                      key={request._id}
+                      className="code-bg p-4 border-2 border-[#39ff14]/50"
+                    >
+                      <div className="flex items-start justify-between mb-3">
+                        <div>
+                          <h3 className="text-lg font-bold text-white pixel-text code-glow">
+                            {sender?.name || 'Unknown User'}
+                          </h3>
+                          {sender?.school && (
+                            <p className="text-sm text-white/60 pixel-text">
+                              {sender.school}
+                            </p>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => handleAcceptRequest(request._id)}
+                          className="bg-[#39ff14] text-black px-4 py-2 border-2 border-[#39ff14] font-bold transition-all duration-200 code-glow hover:bg-[#39ff14]/90 pixel-text text-sm"
+                        >
+                          ACCEPT()
+                        </button>
+                      </div>
+                      {request.message && (
+                        <p className="text-white/80 text-sm pixel-text mb-2">
+                          {request.message}
+                        </p>
+                      )}
+                      {sender?.skills && sender.skills.length > 0 && (
+                        <div className="flex flex-wrap gap-2 mt-2">
+                          {sender.skills.slice(0, 3).map((skill, idx) => (
+                            <span
+                              key={idx}
+                              className="px-2 py-1 bg-[#39ff14]/20 border border-[#39ff14]/50 text-[#39ff14] text-xs font-bold pixel-text"
+                            >
+                              {skill}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            
+            <button
+              onClick={() => setShowRequestsModal(false)}
+              className="mt-6 w-full bg-transparent border-2 border-[#39ff14]/50 text-white hover:border-[#39ff14] hover:text-[#39ff14] py-2 font-bold transition-all duration-200 pixel-text"
+            >
+              CLOSE()
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Groups Panel */}
+      {showGroupsPanel && (
+        <GroupsPanel
+          currentUserId={CURRENT_USER_ID}
+          onSelectTeam={handleSelectTeam}
+          selectedTeamId={selectedTeam?._id}
+          onClose={() => setShowGroupsPanel(false)}
+        />
+      )}
+
+      {/* Chat Panel */}
+      {showChat && selectedTeam && (
+        <ChatPanel
+          team={selectedTeam}
+          currentUserId={CURRENT_USER_ID}
+          currentUserName={currentUserName}
+          onClose={() => {
+            setShowChat(false);
+            setSelectedTeam(null);
+          }}
+        />
+      )}
     </div>
   );
 }
