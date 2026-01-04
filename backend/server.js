@@ -77,6 +77,8 @@ const HackathonSchema = new mongoose.Schema({
   type: String,
   url: String,
   description: String,
+  imageUrl: String, // Add imageUrl field to schema
+  logo: String, // Also support logo field
   isActive: { type: Boolean, default: true }
 }, { collection: 'hackathons' }); // Explicitly set collection name
 
@@ -102,142 +104,58 @@ if (!process.env.GEMINI_API_KEY) {
 }
 
 // Helper function to get model
-function getModel(modelName = 'gemini-2.5-flash') {
+function getModel(modelName = 'gemini-1.5-flash') {
   return genAI.getGenerativeModel({ model: modelName });
-}
-
-// List available models from the API
-async function listAvailableModels() {
-  try {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      return [];
-    }
-    
-    // Use v1 API (stable endpoint)
-    const apiVersions = ['v1'];
-    
-    for (const version of apiVersions) {
-      try {
-        console.log(`🔍 Trying to list models using ${version} API...`);
-        const response = await axios.get(
-          `https://generativelanguage.googleapis.com/${version}/models?key=${apiKey}`,
-          { timeout: 10000 }
-        );
-        
-        if (response.data && response.data.models) {
-          const modelNames = response.data.models
-            .filter(m => m.supportedGenerationMethods && m.supportedGenerationMethods.includes('generateContent'))
-            .map(m => m.name.replace('models/', ''));
-          
-          console.log(`✅ Found ${modelNames.length} available models using ${version} API:`, modelNames);
-          return modelNames;
-        }
-      } catch (versionError) {
-        const status = versionError.response?.status;
-        const statusText = versionError.response?.statusText;
-        const errorData = versionError.response?.data;
-        
-        if (status === 400 && (errorData?.error?.message?.includes('expired') || errorData?.error?.message?.includes('API_KEY'))) {
-          console.error(`❌ API key appears to be expired or invalid (${version} API)`);
-          throw new Error('API key expired or invalid. Please get a new API key from https://aistudio.google.com/apikey');
-        }
-        
-        console.log(`⚠️  ${version} API failed: ${status} ${statusText || versionError.message}`);
-        continue;
-      }
-    }
-    
-    return [];
-  } catch (error) {
-    if (error.message.includes('expired') || error.message.includes('invalid')) {
-      throw error; // Re-throw API key errors
-    }
-    console.error('❌ Error listing models:', error.message);
-    if (error.response) {
-      console.error('   Status:', error.response.status);
-      console.error('   Response:', JSON.stringify(error.response.data).substring(0, 200));
-    }
-    return [];
-  }
 }
 
 // Try to determine which model works by testing API call
 async function getWorkingModel() {
   // First, verify API key is set
   if (!process.env.GEMINI_API_KEY) {
-    throw new Error('GEMINI_API_KEY is not set in environment variables. Add it to your backend/.env file.');
+    throw new Error('GEMINI_API_KEY is not set in environment variables');
   }
   
-  if (process.env.GEMINI_API_KEY.length < 20) {
-    throw new Error('GEMINI_API_KEY appears to be invalid (too short). Please check your .env file.');
-  }
-  
-  // Try to list available models first
-  console.log('🔍 Attempting to list available models from API...');
-  const availableModels = await listAvailableModels();
-  
-  const testPrompt = 'Hi';
-  // Start with models from the API, then fallback to common names
-  let modelsToTry = availableModels.length > 0 
-    ? availableModels 
-      : [
-        'gemini-2.5-flash',        // Latest flash model (most available)
-        'gemini-2.5-pro',          // Latest pro model
-        'gemini-pro',              // Original model (fallback)
-        'gemini-1.5-pro',
-        'gemini-2.5-flash'  // Fallback to latest if others fail
-      ];
-  
-  console.log(`📋 Will try ${modelsToTry.length} models:`, modelsToTry);
-  let lastError = null;
+  const testPrompt = 'test';
+  // Try these models in order (most common first)
+  const modelsToTry = [
+    'gemini-1.5-flash',
+    'gemini-1.5-pro', 
+    'gemini-pro',
+    'models/gemini-1.5-flash',
+    'models/gemini-1.5-pro',
+    'models/gemini-pro'
+  ];
   
   for (const modelName of modelsToTry) {
     try {
       console.log(`🔍 Trying model: ${modelName}`);
       const model = getModel(modelName);
-      // Make a very short test call with timeout
-      const result = await Promise.race([
-        model.generateContent(testPrompt),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000))
-      ]);
-    const response = await result.response;
+      // Make a very short test call
+      const result = await model.generateContent(testPrompt);
+      const response = await result.response;
       const text = response.text();
       console.log(`✅ Model ${modelName} is available and working!`);
       return model;
     } catch (error) {
       const errorMsg = error.message || error.toString();
-      lastError = errorMsg;
-      console.log(`❌ Model ${modelName} failed: ${errorMsg.substring(0, 200)}`);
-      
-      // If it's a 401/403/400 with API key error, the API key is invalid or expired
-      if (errorMsg.includes('401') || errorMsg.includes('403') || 
-          errorMsg.includes('API_KEY') || errorMsg.includes('API key') ||
-          errorMsg.includes('API key expired') || errorMsg.includes('API_KEY_INVALID') ||
-          errorMsg.includes('expired')) {
-        throw new Error('Invalid, expired, or unauthorized GEMINI_API_KEY. Please:\n1. Get a NEW API key from https://aistudio.google.com/apikey (make sure to create a new one, not reuse an old one)\n2. Copy the ENTIRE key (it should be ~39 characters)\n3. Add it to backend/.env as: GEMINI_API_KEY=your_key_here\n4. Make sure there are no extra spaces or quotes\n5. Restart your server after updating .env');
+      console.log(`❌ Model ${modelName} failed: ${errorMsg.substring(0, 150)}`);
+      // If it's a 401/403, the API key is invalid
+      if (errorMsg.includes('401') || errorMsg.includes('403') || errorMsg.includes('API_KEY')) {
+        throw new Error('Invalid GEMINI_API_KEY. Please check your API key in the .env file.');
       }
-      
-      // If it's a 404, model not found - continue to next
-      if (errorMsg.includes('404') || errorMsg.includes('not found')) {
-        continue;
-      }
-      
-      // For other errors, continue trying
+      // Continue to next model
       continue;
     }
   }
   
-  // If we get here, all models failed
-  const errorDetails = lastError ? `\nLast error: ${lastError.substring(0, 200)}` : '';
-  throw new Error(`No working Gemini models found.${errorDetails}\n\nTroubleshooting:\n1. Verify your API key at https://aistudio.google.com/apikey\n2. Make sure GEMINI_API_KEY is set in backend/.env\n3. Restart your server after updating .env\n4. Check that your API key has access to Gemini models`);
+  throw new Error('No working Gemini models found. Your API key may not have access to Gemini models, or the model names have changed. Please verify your GEMINI_API_KEY at https://aistudio.google.com/apikey');
 }
 
 // AI Matchmaking Helper Functions
 async function calculateMatchScore(user1, user2, teamMembers = null) {
   try {
-    // Use gemini-2.5-flash (available in v1 API)
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    // Use gemini-1.5-flash which is available in v1beta API
+    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
     let prompt;
 
@@ -466,17 +384,25 @@ app.get('/hackathons', async (req, res) => {
         }
       }
 
-      return {
+      const result = {
         id: hackathon._id.toString(),
         name: hackathon.name || 'Hackathon Event',
         start_date: start_date,
         end_date: end_date,
         location: hackathon.location || 'Location TBD',
         url: hackathon.url || 'https://mlh.io',
-        logo: null,
+        logo: hackathon.logo || null,
+        imageUrl: hackathon.imageUrl || null, // Include imageUrl field from MongoDB
         description: hackathon.description || '',
         type: hackathon.type || ''
       };
+      
+      // Debug: Log if imageUrl exists
+      if (hackathon.imageUrl) {
+        console.log(`✅ Backend: Found imageUrl for ${result.name}:`, hackathon.imageUrl);
+      }
+      
+      return result;
     }).sort((a, b) => {
       // Sort by start date, with null dates at the end
       if (!a.start_date && !b.start_date) return 0;
@@ -490,6 +416,14 @@ app.get('/hackathons', async (req, res) => {
     console.error('Error fetching hackathons:', error);
     res.status(500).json({ error: error.message });
   }
+});
+
+// GET /hackathons/mlh - Deprecated: All hackathons come from MongoDB via /hackathons
+app.get('/hackathons/mlh', async (req, res) => {
+  res.status(200).json({ 
+    message: 'This endpoint is deprecated. All hackathon data comes from MongoDB. Use GET /hackathons instead.',
+    redirect: '/hackathons'
+  });
 });
 
 // Root endpoint
@@ -788,13 +722,13 @@ Return ONLY raw JSON, no markdown code blocks.`;
   }
 });
 
-// PUT /api/users/:id - Update or create user profile (for onboarding save)
+// PUT /api/users/:id - Update user profile (for onboarding save)
 app.put('/api/users/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { userData, selectedHackathons } = req.body;
     
-    console.log('💾 Saving user profile for ID:', id);
+    console.log('💾 Updating user profile for ID:', id);
     console.log('📋 User data:', userData);
     console.log('📋 Selected hackathons:', selectedHackathons);
     
@@ -802,50 +736,32 @@ app.put('/api/users/:id', async (req, res) => {
       return res.status(400).json({ error: 'User data with name is required' });
     }
     
-    // Prepare user data
-    const userToSave = {
+    // Prepare update data
+    const updateData = {
       ...userData,
       registered_hackathons: selectedHackathons || []
     };
     
-    // Try to find existing user first
-    let existingUser = await User.findById(id);
+    // Use findByIdAndUpdate to save the form data into the user document
+    const updatedUser = await User.findByIdAndUpdate(
+      id,
+      { $set: updateData },
+      { new: true, runValidators: true }
+    );
     
-    if (existingUser) {
-      // Update existing user
-      Object.assign(existingUser, userToSave);
-      await existingUser.save();
-      console.log('✅ User profile updated successfully:', existingUser._id);
-      res.status(200).json({
-        success: true,
-        user: existingUser,
-        message: 'Profile updated successfully'
-      });
-    } else {
-      // Create new user with the provided ID (or let MongoDB generate one)
-      // If the ID is the hardcoded demo ID, use it; otherwise create new
-      let newUser;
-      if (id === '6958c084d6d4ea1f109dad70') {
-        // Use the hardcoded ID for demo
-        newUser = await User.create({
-          _id: id,
-          ...userToSave
-        });
-      } else {
-        // Create new user (MongoDB will generate ID)
-        newUser = await User.create(userToSave);
-      }
-      
-      console.log('✅ New user profile created successfully:', newUser._id);
-      res.status(201).json({
-        success: true,
-        user: newUser,
-        message: 'Profile created successfully'
-      });
+    if (!updatedUser) {
+      return res.status(404).json({ error: 'User not found' });
     }
+    
+    console.log('✅ User profile updated successfully:', updatedUser._id);
+    res.status(200).json({
+      success: true,
+      user: updatedUser,
+      message: 'Profile saved successfully'
+    });
   } catch (error) {
-    console.error('❌ Error saving user profile:', error);
-    res.status(500).json({ error: error.message || 'Save failed' });
+    console.error('❌ Error updating user profile:', error);
+    res.status(500).json({ error: error.message || 'Update failed' });
   }
 });
 
@@ -865,32 +781,27 @@ app.post('/api/onboarding/save', async (req, res) => {
       return res.status(400).json({ error: 'User data with name is required' });
     }
     
-    // Prepare user data
-    const userToSave = {
+    // Prepare update data
+    const updateData = {
       ...userData,
       registered_hackathons: selectedHackathons || []
     };
     
-    // Try to find existing user first
-    let existingUser = await User.findById(userId);
+    // Use findByIdAndUpdate to save the form data
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      { $set: updateData },
+      { new: true, runValidators: true }
+    );
     
-    if (existingUser) {
-      // Update existing user
-      Object.assign(existingUser, userToSave);
-      await existingUser.save();
-      console.log('✅ User profile updated successfully:', existingUser._id);
-    } else {
-      // Create new user with the hardcoded ID
-      existingUser = await User.create({
-        _id: userId,
-        ...userToSave
-      });
-      console.log('✅ New user profile created successfully:', existingUser._id);
+    if (!updatedUser) {
+      return res.status(404).json({ error: 'User not found' });
     }
     
+    console.log('✅ User profile saved successfully:', updatedUser._id);
     res.json({ 
       success: true, 
-      userId: existingUser._id,
+      userId: updatedUser._id,
       message: 'Profile saved successfully'
     });
   } catch (error) {
@@ -923,7 +834,7 @@ app.post('/match-score', async (req, res) => {
     console.log(`✅ Matchmaking for: ${currentUser.name} vs ${targetUser.name}`);
 
     // 2. Prepare Matchmaking Logic
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
     // Construct the requested System Prompt
     const prompt = `You are a hackathon matchmaking agent. Compare the skills and roles of User A and User B. 
@@ -1196,66 +1107,39 @@ app.get('/test-gemini', async (req, res) => {
     }
     
     console.log('🔍 Testing Gemini API key...');
-    console.log('📋 API Key length:', process.env.GEMINI_API_KEY.length);
-    console.log('📋 API Key preview:', process.env.GEMINI_API_KEY.substring(0, 10) + '...');
-    
     const testPrompt = 'Say "Hello"';
-    // Try the most basic model first - gemini-pro should always work
     const modelsToTry = [
-      'gemini-2.5-flash',        // Latest flash model
-      'gemini-2.5-pro',          // Latest pro model
-      'gemini-pro',              // Original model (fallback)
-      'gemini-1.5-pro',
-      'gemini-2.5-flash'  // Fallback to latest if others fail
+      'gemini-1.5-flash',
+      'gemini-1.5-pro', 
+      'gemini-pro'
     ];
     
     const results = [];
     for (const modelName of modelsToTry) {
       try {
-        console.log(`🔍 Testing ${modelName}...`);
         const model = genAI.getGenerativeModel({ model: modelName });
         const result = await model.generateContent(testPrompt);
         const response = await result.response;
         const text = response.text();
         results.push({ model: modelName, status: '✅ Working', response: text.substring(0, 50) });
         console.log(`✅ ${modelName} works!`);
-        // If we find a working model, we can stop early
-        break;
       } catch (error) {
         const errorMsg = error.message || error.toString();
-        const errorDetails = {
+        results.push({ 
           model: modelName, 
           status: '❌ Failed', 
-          error: errorMsg.substring(0, 300),
-          is404: errorMsg.includes('404'),
-          isAuth: errorMsg.includes('401') || errorMsg.includes('403')
-        };
-        results.push(errorDetails);
-        console.log(`❌ ${modelName} failed: ${errorMsg.substring(0, 150)}`);
+          error: errorMsg.substring(0, 200) 
+        });
+        console.log(`❌ ${modelName} failed: ${errorMsg.substring(0, 100)}`);
       }
     }
     
     const workingModels = results.filter(r => r.status === '✅ Working');
-    const authErrors = results.filter(r => r.isAuth);
-    const all404 = results.every(r => r.is404);
-    
     if (workingModels.length === 0) {
-      let helpMessage = 'Your API key may be invalid or not have access to Gemini models.';
-      if (authErrors.length > 0) {
-        helpMessage = 'Your API key appears to be invalid or unauthorized. Please get a new key from https://aistudio.google.com/apikey';
-      } else if (all404) {
-        helpMessage = 'All models returned 404. This might mean:\n1. Your API key doesn\'t have access to Gemini models\n2. The models are not available in your region\n3. You need to enable the Generative Language API in Google Cloud Console\n\nGet a new API key at https://aistudio.google.com/apikey and make sure to enable the API.';
-      }
-      
       return res.status(500).json({
         error: 'No working models found',
         results: results,
-        help: helpMessage,
-        troubleshooting: {
-          apiKeyLength: process.env.GEMINI_API_KEY.length,
-          allModels404: all404,
-          hasAuthErrors: authErrors.length > 0
-        }
+        help: 'Your API key may be invalid or not have access to Gemini models. Get a new key at https://aistudio.google.com/apikey'
       });
     }
     
@@ -1266,7 +1150,7 @@ app.get('/test-gemini', async (req, res) => {
       message: `Found ${workingModels.length} working model(s)`
     });
   } catch (error) {
-    res.status(500).json({ error: error.message, stack: error.stack });
+    res.status(500).json({ error: error.message });
   }
 });
 
